@@ -192,4 +192,10 @@ This repo is based on [LAMDA-PILOT](https://github.com/LAMDA-CL/LAMDA-PILOT).
 
 ## 🚀 Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=byzhaoAI/VILA&type=date&legend=top-left)](https://www.star-history.com/#byzhaoAI/VILA&type=date&legend=top-left)
+<a href="https://www.star-history.com/?repos=byzhaoAI%2FVILA&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=byzhaoAI/VILA&type=date&theme=dark&legend=top-left&sealed_token=beOUGDbPgOFQpuG7SQ19_mr6Prz0wFqRZN3SZKZAcisue9RhRafs755DV_mGIkANPkkEHyvOpedHCoS6aIsPeKSrC4YILOf_rLBIJyS4qejh8HrSzVgZVJYRsIFgMajsRg1rVRU1JAp0adUey9swA7afewocSr4w7oWIOyqa07hJPiO0frC3GTcItlqs" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=byzhaoAI/VILA&type=date&legend=top-left&sealed_token=beOUGDbPgOFQpuG7SQ19_mr6Prz0wFqRZN3SZKZAcisue9RhRafs755DV_mGIkANPkkEHyvOpedHCoS6aIsPeKSrC4YILOf_rLBIJyS4qejh8HrSzVgZVJYRsIFgMajsRg1rVRU1JAp0adUey9swA7afewocSr4w7oWIOyqa07hJPiO0frC3GTcItlqs" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=byzhaoAI/VILA&type=date&legend=top-left&sealed_token=beOUGDbPgOFQpuG7SQ19_mr6Prz0wFqRZN3SZKZAcisue9RhRafs755DV_mGIkANPkkEHyvOpedHCoS6aIsPeKSrC4YILOf_rLBIJyS4qejh8HrSzVgZVJYRsIFgMajsRg1rVRU1JAp0adUey9swA7afewocSr4w7oWIOyqa07hJPiO0frC3GTcItlqs" />
+ </picture>
+</a>
