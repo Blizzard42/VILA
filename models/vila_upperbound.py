@@ -139,7 +139,51 @@ class AGaLUHead(nn.Module):
         return {"buffer_feature": h, "logits": self.head(self.drop(h))}
 
 
-HEADS = {"vila-mimic": VilaMimicHead, "relu": ReLUHead, "agalu": AGaLUHead}
+class AGaLU3Head(nn.Module):
+    """e_47 acil_upperbound AGaLU3 port: 3-layer AGaLU, both hidden layers
+    width kh = args["Hidden"], both gates anchored to the TRUE input:
+        h1 = 1[Bg1 x > 0] (o) (W1 x)
+        h2 = 1[Bg2 x > 0] (o) (W2 h1)
+    Bg1/Bg2 frozen ~ N(0, 1/d); W1 ~ N(0, 1/d), W2 ~ N(0, 1/kh) trainable
+    (variance-preserving for their input dims); optional dropout before the
+    growing bias-free head."""
+
+    def __init__(self, in_features, args, device):
+        super().__init__()
+        kh = args["Hidden"]
+        self.register_buffer(
+            "Bg1", torch.randn(kh, in_features, device=device) / in_features ** 0.5)
+        self.register_buffer(
+            "Bg2", torch.randn(kh, in_features, device=device) / in_features ** 0.5)
+        self.W1 = nn.Parameter(
+            torch.randn(kh, in_features, device=device) / in_features ** 0.5)
+        self.W2 = nn.Parameter(
+            torch.randn(kh, kh, device=device) / kh ** 0.5)
+        drop = args.get("head_dropout", 0.0)
+        self.drop = nn.Dropout(drop) if drop > 0 else nn.Identity()
+        self.head = nn.Linear(kh, 0, bias=False, device=device)
+
+    @torch.no_grad()
+    def preprocess(self, network, images, clip_images):
+        return network(images, clip_images)["features"]
+
+    @torch.no_grad()
+    def append_task(self, num_new_classes):
+        old = self.head.weight
+        new = nn.Linear(self.head.in_features, old.shape[0] + num_new_classes,
+                        bias=False, device=old.device)
+        new.weight.zero_()
+        new.weight[: old.shape[0]] = old
+        self.head = new
+
+    def forward(self, features):
+        h1 = (features @ self.Bg1.T > 0).to(features.dtype) * (features @ self.W1.T)
+        h2 = (features @ self.Bg2.T > 0).to(features.dtype) * (h1 @ self.W2.T)
+        return {"buffer_feature": h2, "logits": self.head(self.drop(h2))}
+
+
+HEADS = {"vila-mimic": VilaMimicHead, "relu": ReLUHead, "agalu": AGaLUHead,
+         "agalu3": AGaLU3Head}
 
 
 # --------------------------------------------------------------------------
