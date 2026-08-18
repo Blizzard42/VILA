@@ -18,9 +18,14 @@ v0 "vila-mimic" is AC_Linear with the solve swapped for SGD: frozen random
 Linear(d, Hidden) -> ReLU -> growing bias-free Linear (the only trainable
 part, exactly the weights VILA sets analytically).
 
+"relu" and "agalu" are the e_47 acil_upperbound 1-hidden-layer heads ported
+to this interface: relu -> h = relu(W1 x), agalu -> h = 1[Bg x>0] (o) (W1 x)
+(Bg frozen); both size the hidden layer with the existing "Hidden" key and
+keep W1 across tasks (fresh optimizer per task, as always).
+
 New config keys (all optional): head_model, head_lr, head_epochs,
 head_schedule, head_momentum, head_opt, head_wd, head_batch_size,
-head_eval_every.
+head_eval_every, head_dropout.
 """
 import logging
 
@@ -68,7 +73,73 @@ class VilaMimicHead(nn.Module):
         return {"buffer_feature": h, "logits": self.head(h)}
 
 
-HEADS = {"vila-mimic": VilaMimicHead}
+class ReLUHead(nn.Module):
+    """e_47 acil_upperbound ReLU port: 1 trainable hidden layer,
+    h = relu(W1 x), W1 ~ N(0, 1/d), width = args["Hidden"]; optional dropout
+    (head_dropout) before the growing bias-free head."""
+
+    def __init__(self, in_features, args, device):
+        super().__init__()
+        kh = args["Hidden"]
+        self.W1 = nn.Parameter(
+            torch.randn(kh, in_features, device=device) / in_features ** 0.5)
+        drop = args.get("head_dropout", 0.0)
+        self.drop = nn.Dropout(drop) if drop > 0 else nn.Identity()
+        self.head = nn.Linear(kh, 0, bias=False, device=device)
+
+    @torch.no_grad()
+    def preprocess(self, network, images, clip_images):
+        return network(images, clip_images)["features"]
+
+    @torch.no_grad()
+    def append_task(self, num_new_classes):
+        old = self.head.weight
+        new = nn.Linear(self.head.in_features, old.shape[0] + num_new_classes,
+                        bias=False, device=old.device)
+        new.weight.zero_()
+        new.weight[: old.shape[0]] = old
+        self.head = new
+
+    def forward(self, features):
+        h = F.relu(features @ self.W1.T)
+        return {"buffer_feature": h, "logits": self.head(self.drop(h))}
+
+
+class AGaLUHead(nn.Module):
+    """e_47 acil_upperbound BasicAGaLU port: 1 gated hidden layer,
+    h = 1[Bg x > 0] (o) (W1 x) with Bg frozen ~ N(0, 1/d) and W1 trainable
+    ~ N(0, 1/d), width = args["Hidden"]; optional dropout (head_dropout)."""
+
+    def __init__(self, in_features, args, device):
+        super().__init__()
+        kh = args["Hidden"]
+        self.register_buffer(
+            "Bg", torch.randn(kh, in_features, device=device) / in_features ** 0.5)
+        self.W1 = nn.Parameter(
+            torch.randn(kh, in_features, device=device) / in_features ** 0.5)
+        drop = args.get("head_dropout", 0.0)
+        self.drop = nn.Dropout(drop) if drop > 0 else nn.Identity()
+        self.head = nn.Linear(kh, 0, bias=False, device=device)
+
+    @torch.no_grad()
+    def preprocess(self, network, images, clip_images):
+        return network(images, clip_images)["features"]
+
+    @torch.no_grad()
+    def append_task(self, num_new_classes):
+        old = self.head.weight
+        new = nn.Linear(self.head.in_features, old.shape[0] + num_new_classes,
+                        bias=False, device=old.device)
+        new.weight.zero_()
+        new.weight[: old.shape[0]] = old
+        self.head = new
+
+    def forward(self, features):
+        h = (features @ self.Bg.T > 0).to(features.dtype) * (features @ self.W1.T)
+        return {"buffer_feature": h, "logits": self.head(self.drop(h))}
+
+
+HEADS = {"vila-mimic": VilaMimicHead, "relu": ReLUHead, "agalu": AGaLUHead}
 
 
 # --------------------------------------------------------------------------
@@ -197,6 +268,7 @@ class Learner(VilaLearner):
             text_features = self._feat_from_temp()
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         n = self._seen_feats.shape[0]
+        self.head.train()  # dropout active only while fitting
         for epoch in range(1, self.head_epochs + 1):
             lr_now = opt.param_groups[0]["lr"]
             perm = torch.randperm(n, device=self._device)
@@ -218,7 +290,9 @@ class Learner(VilaLearner):
             test_acc = ""
             if self.head_eval_every > 0 and (epoch % self.head_eval_every == 0
                                              or epoch == self.head_epochs):
+                self.head.eval()
                 test_acc = self._eval_cached(text_features)
+                self.head.train()
             print(self._cur_task, epoch, lr_now, train_loss, train_acc, test_acc,
                   file=self._head_log, sep=",")
             if epoch % max(1, self.head_epochs // 5) == 0 or epoch == self.head_epochs:
@@ -227,3 +301,4 @@ class Learner(VilaLearner):
                     "train_acc {:.4f} test_acc {}".format(
                         self._cur_task, epoch, self.head_epochs, lr_now,
                         train_loss, train_acc, test_acc))
+        self.head.eval()
