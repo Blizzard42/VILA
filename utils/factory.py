@@ -50,6 +50,8 @@ def get_model(model_name, args):
         from models.tuna import Learner
     elif name == 'vila':
         from models.vila import Learner
+    elif name == 'vila_upperbound':
+        from models.vila_upperbound import Learner
     else:
         assert 0
     return Learner(args)
