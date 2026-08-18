@@ -116,13 +116,12 @@ def get_backbone(args, pretrained=False):
             else:
                 raise NotImplementedError("Unknown type {}".format(name))
             
-            model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-16', pretrained=_pretrained)
-
-            # If Hugging Face is unreachable, manually download the weights and use the code below:
-            # model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-16', pretrained=None)
-            # state_dict = torch.load("./ckpt/timm/vit_base_patch16_clip_224.laion400m_e32/open_clip_pytorch_model.bin")
-            # msg = model.load_state_dict(state_dict)
-            # print(msg)
+            # e_48 repair: the upstream HF-path freeze loop references `msg`,
+            # which only exists in this (upstream-provided) manual-load fallback.
+            model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-16', pretrained=None)
+            state_dict = torch.load("./ckpt/timm/vit_base_patch16_clip_224.laion400m_e32/open_clip_pytorch_model.bin")
+            msg = model.load_state_dict(state_dict)
+            print(msg)
 
             # freeze all but the trainable parameters
             for name, p in model.named_parameters():
