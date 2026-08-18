@@ -88,7 +88,7 @@ class DataManager(object):
 
         data, targets = np.concatenate(data), np.concatenate(targets)
 
-        if self.args['model_name'] in ['vila']:
+        if self.args['model_name'] in ['vila', 'vila_upperbound']:
             if mode == "train":
                 clip_trsf = transforms.Compose([*self._clip_train_trsf, *self._clip_common_trsf])
             elif mode == "flip":
@@ -178,7 +178,7 @@ class DataManager(object):
         self._test_trsf = idata.test_trsf
         self._common_trsf = idata.common_trsf
 
-        if self.args['model_name'] in ['vila']:
+        if self.args['model_name'] in ['vila', 'vila_upperbound']:
             from utils.data_clip import build_transform
             self._clip_train_trsf = build_transform(True, None)
             self._clip_test_trsf = build_transform(False, None)
