@@ -24,8 +24,8 @@ def _train(args):
     init_cls = 0 if args ["init_cls"] == args["increment"] else args["init_cls"]
     logs_name = "logs/{}/{}/{}/{}".format(args["model_name"],args["dataset"], init_cls, args['increment'])
     
-    if not os.path.exists(logs_name):
-        os.makedirs(logs_name)
+    # exist_ok: concurrent array tasks race to create a new dataset's log dir
+    os.makedirs(logs_name, exist_ok=True)
 
     logfilename = "logs/{}/{}/{}/{}/{}_{}_{}".format(
         args["model_name"],
