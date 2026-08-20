@@ -48,12 +48,15 @@ class VilaMimicHead(nn.Module):
     """AC_Linear trained by SGD: fc0 is the same random frozen expansion
     (nn.Linear default init, VILA never trains it — update_fc only carries it
     forward), the last layer grows per task with zero-init new rows (mirrors
-    update_fc's zero-padding)."""
+    update_fc's zero-padding); optional dropout (head_dropout) on h before
+    the growing head, same placement as the other heads."""
 
     def __init__(self, in_features, args, device):
         super().__init__()
         self.fc0 = nn.Linear(in_features, args["Hidden"], bias=False, device=device)
         self.fc0.weight.requires_grad_(False)
+        drop = args.get("head_dropout", 0.0)
+        self.drop = nn.Dropout(drop) if drop > 0 else nn.Identity()
         self.head = nn.Linear(args["Hidden"], 0, bias=False, device=device)
 
     @torch.no_grad()
@@ -71,7 +74,7 @@ class VilaMimicHead(nn.Module):
 
     def forward(self, features):
         h = F.relu(self.fc0(features))
-        return {"buffer_feature": h, "logits": self.head(h)}
+        return {"buffer_feature": h, "logits": self.head(self.drop(h))}
 
 
 class ReLUHead(nn.Module):

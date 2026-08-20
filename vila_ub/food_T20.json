@@ -1,0 +1,37 @@
+{
+    "prefix": "",
+    "dataset": "food101",
+    "memory_size": 0,
+    "memory_per_class": 0,
+    "fixed_memory": false,
+    "shuffle": true,
+    "init_cls": 5,
+    "increment": 5,
+    "model_name": "vila_upperbound",
+    "backbone_type": "pretrained_vit_b16_224_adapter",
+    "device": [
+        "0"
+    ],
+    "seed": [
+        1993
+    ],
+    "num_workers": 8,
+    "optimizer": "sgd",
+    "batch_size": 32,
+    "adpt_epoch": 30,
+    "init_lr": 0.01,
+    "weight_decay": 0.0005,
+    "min_lr": 1e-06,
+    "Hidden": 16384,
+    "ffn_num": 64,
+    "rerank_topk": 6,
+    "head_model": "vila-mimic",
+    "head_lr": 0.001,
+    "head_epochs": 100,
+    "head_schedule": "constant",
+    "head_momentum": 0.9,
+    "head_opt": "sgd",
+    "head_wd": 0.0,
+    "head_batch_size": 4096,
+    "head_eval_every": 10
+}
