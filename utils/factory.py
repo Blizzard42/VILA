@@ -52,6 +52,8 @@ def get_model(model_name, args):
         from models.vila import Learner
     elif name == 'vila_upperbound':
         from models.vila_upperbound import Learner
+    elif name == 'vila_lip':
+        from models.vila_lip import Learner
     else:
         assert 0
     return Learner(args)
