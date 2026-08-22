@@ -133,12 +133,31 @@ class Learner(UpperboundLearner):
                          .format(self._cur_task, int(n_old), m - n_old))
             return
         # ---- lip ----
+        # verbatim until full (wave 3): while N_seen <= m the union of seen
+        # rows IS an exact m'-point memory (int labels, no fit -- lossless by
+        # construction).  The first real fit happens once N_seen > m.
+        if N_prev + new_X.shape[0] <= m:
+            self._mem_X = (new_X.clone() if self._mem_X is None
+                           else torch.cat([self._mem_X, new_X]))
+            self._mem_Y = (new_y.clone() if self._mem_Y is None
+                           else torch.cat([self._mem_Y, new_y]))
+            logging.info("task {} lip memory: verbatim ({} rows <= m={}, "
+                         "no fit)".format(self._cur_task,
+                                          self._mem_X.shape[0], m))
+            return
         Y_new = F.one_hot(new_y, C).double()         # plain one-hots (c.9)
         parts = [(new_X.double(), Y_new, 1.0 - w_old)]
         if self._mem_X is not None:
-            Y_old = F.pad(self._mem_Y, (0, C - self._mem_Y.shape[1]))
+            Y_old = (F.one_hot(self._mem_Y, C).float()   # verbatim -> one-hot
+                     if not self._mem_Y.dtype.is_floating_point
+                     else F.pad(self._mem_Y, (0, C - self._mem_Y.shape[1])))
             parts.insert(0, (self._mem_X.double(), Y_old.double(), w_old))
             B0, Y0 = self._mem_X, Y_old              # warm start (Q2)
+            if B0.shape[0] < m:      # verbatim memory smaller than m: top up
+                d = torch.randperm(new_X.shape[0],   # from new rows (mirrors
+                                   device=self._device)[:m - B0.shape[0]]
+                B0 = torch.cat([B0, new_X[d]])       # the first-fit init rule)
+                Y0 = torch.cat([Y0, Y_new[d].float()])
         else:                                        # first fit: uniform draw
             draw = torch.randperm(new_X.shape[0], device=self._device)[:m]
             B0, Y0 = new_X[draw], Y_new[draw].float()
