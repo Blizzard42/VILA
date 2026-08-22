@@ -26,7 +26,11 @@ keep W1 across tasks (fresh optimizer per task, as always).
 New config keys (all optional): head_model, head_lr, head_epochs,
 head_schedule, head_momentum, head_opt, head_wd, head_batch_size,
 head_eval_every, head_dropout, head_input_noise (train-time gaussian noise on
-the cached features, sigma in per-dim std units of the seen cache).
+the cached features, sigma in per-dim std units of the seen cache), head_l2
+(gamma of the analytic ridge: adds (gamma/(N_seen*C_seen))*sum||W||^2 over
+ALL trainable head params to the mean-MSE loss, so the minimizer matches the
+analytic solve's sum-SE + gamma*||W||^2 objective; CSV train_loss stays pure
+MSE).
 """
 import logging
 
@@ -255,6 +259,7 @@ class Learner(VilaLearner):
         self.head_momentum = args.get("head_momentum", 0.9)
         self.head_opt = args.get("head_opt", "sgd")
         self.head_wd = args.get("head_wd", 0.0)
+        self.head_l2 = args.get("head_l2", 0.0)
         self.head_batch_size = args.get("head_batch_size", 4096)
         self.head_eval_every = args.get("head_eval_every", 0)
         # CSVs land next to trainer.py's log file, same naming scheme
@@ -366,6 +371,9 @@ class Learner(VilaLearner):
         # (growing) seen cache; resampled every minibatch
         in_noise = self.args.get("head_input_noise", 0.0)
         feat_std = self._seen_feats.std(dim=0) if in_noise > 0 else None
+        # exact ridge match: analytic objective is sum-SE + gamma*||W||^2;
+        # ours is mean-MSE, so the equivalent coefficient is gamma/(N*C)
+        l2_coef = self.head_l2 / (n * self._total_classes)
         self.head.train()  # dropout active only while fitting
         for epoch in range(1, self.head_epochs + 1):
             lr_now = opt.param_groups[0]["lr"]
@@ -378,11 +386,14 @@ class Learner(VilaLearner):
                     X = X + in_noise * feat_std * torch.randn_like(X)
                 opt.zero_grad(set_to_none=True)
                 logits = self.head(X)["logits"]
-                loss = F.mse_loss(logits, F.one_hot(
+                mse = F.mse_loss(logits, F.one_hot(
                     y, self._total_classes).to(logits.dtype))
+                loss = mse
+                if l2_coef > 0:
+                    loss = mse + l2_coef * sum(p.pow(2).sum() for p in params)
                 loss.backward()
                 opt.step()
-                loss_sum += loss.item() * y.numel()
+                loss_sum += mse.item() * y.numel()
                 correct += (logits.argmax(dim=1) == y).sum().item()
             if sched is not None:
                 sched.step()
