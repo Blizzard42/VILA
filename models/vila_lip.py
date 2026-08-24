@@ -61,6 +61,12 @@ class Learner(UpperboundLearner):
         self.lip_lambda_mv = args.get("lip_lambda_mv", 0.5)
         self.lip_fit_eval_every = args.get("lip_fit_eval_every", 800)
         self.lip_fit_adam_eps = args.get("lip_fit_adam_eps", 1e-8)
+        # wave-4 fit knobs (defaults reproduce waves 1-3 exactly)
+        self.lip_fit_mb = args.get("lip_fit_mb", 0)
+        self.lip_fit_jitter = args.get("lip_fit_jitter", 0.0)
+        self.lip_fit_snapshot_best = args.get("lip_fit_snapshot_best", False)
+        self.lip_fit_init = args.get("lip_fit_init", "warm")
+        assert self.lip_fit_init in ("warm", "rand"), self.lip_fit_init
         self._seen_count = 0            # real rows seen so far (the weights)
         self._mem_X = self._mem_Y = None  # Y: fp32 [m, C] (lip) | int labels
         self._lip_log = None
@@ -161,6 +167,11 @@ class Learner(UpperboundLearner):
         else:                                        # first fit: uniform draw
             draw = torch.randperm(new_X.shape[0], device=self._device)[:m]
             B0, Y0 = new_X[draw], Y_new[draw].float()
+        if self.lip_fit_init == "rand":              # from-scratch every fit:
+            allZ = torch.cat([p[0] for p in parts]).float()   # moment-matched
+            B0 = (allZ.mean(0) + allZ.std(0)                  # Gaussian atoms
+                  * torch.randn(m, allZ.shape[1], device=self._device))
+            Y0 = 0.01 * torch.randn(m, C, device=self._device)
         TAR = make_target(parts, self.head.Bg)
         logging.info("task {} lip fit: target {} rows (w_old={:.4f}), m={}, "
                      "{} steps".format(self._cur_task, TAR["Z"].shape[0],
@@ -169,6 +180,8 @@ class Learner(UpperboundLearner):
                       fit_lr=self.lip_fit_lr, lam=self.lip_lambda_mv,
                       eval_every=self.lip_fit_eval_every,
                       adam_eps=self.lip_fit_adam_eps,
+                      mb=self.lip_fit_mb, jitter=self.lip_fit_jitter,
+                      snapshot_best=self.lip_fit_snapshot_best,
                       verbose=lambda s: logging.info(s.strip()))
         if fit["status"] != "ok":
             raise RuntimeError("lip fit diverged at task {} step {}".format(

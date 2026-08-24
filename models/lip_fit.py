@@ -142,12 +142,28 @@ def _rms(t):
 
 
 def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
-            dtype=torch.float32, verbose=print):
+            dtype=torch.float32, mb=0, jitter=0.0, snapshot_best=False,
+            verbose=print):
     """One LIP fit: Adam on free natural-scale (atoms, targets), init (B0, Y0)
     -- the warm start IS the init (no redraw, no Y* solve) -- minimizing the
     exact full-batch J against the weighted target.  RELATIVE lr: each param
     group steps at fit_lr * rms(group at this fit's init).
-    -> dict(B fp32, Yat fp32, curve, status, final_*)."""
+
+    mb > 0        exp_1-style stochastic estimator: each step draws mb target
+                  rows WITH replacement, proportional to their weights, and
+                  uses them at uniform weight 1/mb.  Unbiased: the target-
+                  quadratic part of J is the constant S terms; every sampled
+                  term is linear in the target measure.
+    jitter > 0    per-step Gaussian jitter on the target rows, sigma = jitter
+                  in per-dim (unweighted) std units of the target; gates of
+                  the jittered rows are re-derived (tied).  NOTE this biases
+                  the target (distills a smoothed distribution).
+    snapshot_best return the atoms from the best exact-J snapshot (the
+                  eval_every cadence) instead of the final step.
+
+    The reported curve is ALWAYS the exact fp64 J of the stored state against
+    the true (un-jittered, full) target.
+    -> dict(B fp32, Yat fp32, curve, status, best_step, final_*)."""
     assert not torch.backends.cuda.matmul.allow_tf32, \
         "TF32 breaks the fp32 mask-Gram exactness argument"
     mom = wmoments(TAR)
@@ -160,9 +176,13 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
     Z_f, Y_f = TAR["Z"].to(dtype), TAR["Y"].to(dtype)
     w_f, Bg_f = TAR["w"].to(dtype), Bg.to(dtype)
     G0 = masks(Bp.detach(), Bg_f)                 # init masks, for flip drift
+    Z_std = Z_f.std(dim=0) if jitter > 0 else None
+    w_mb = (torch.full((mb,), 1.0 / mb, dtype=dtype, device=Z_f.device)
+            if mb else None)
 
     curve = {k: [] for k in LIP_CURVE}
     status, diverged_at = "ok", None
+    best = dict(J=float("inf"), B=None, Y=None, step=0)
     t0 = time.time()
 
     def snapshot(step):
@@ -173,12 +193,22 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
                                         .double().mean().item()))
             for k in LIP_CURVE:
                 curve[k].append(sn[k])
+            if snapshot_best and sn["J"] < best["J"]:
+                best.update(J=sn["J"], step=int(step),
+                            B=Bp.detach().clone(), Y=Yp.detach().clone())
         return sn
 
     snapshot(0)
     for t in range(steps):
+        Z_t, Y_t, w_t, G_t = Z_f, Y_f, w_f, TAR["G"]
+        if mb:
+            idx = torch.multinomial(w_f, mb, replacement=True)
+            Z_t, Y_t, G_t, w_t = Z_f[idx], Y_f[idx], TAR["G"][idx], w_mb
+        if jitter > 0:
+            Z_t = Z_t + jitter * Z_std * torch.randn_like(Z_t)
+            G_t = masks(Z_t, Bg_f)                # jittered gates (tied)
         G_B = masks(Bp, Bg_f)                     # tied: a.e. gradient
-        loss, _, _ = _J_terms(Bp, Yp, G_B, Z_f, Y_f, w_f, TAR["G"],
+        loss, _, _ = _J_terms(Bp, Yp, G_B, Z_t, Y_t, w_t, G_t,
                               mom["S_M"], mom["S_V"], lam)
         lv = float(loss.detach().item())
         if not (lv == lv) or abs(lv) > DIVERGE_ABS:   # nan-safe
@@ -195,12 +225,17 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
                         f"J={sn['J']:.6e} J_M={sn['J_M']:.3e} "
                         f"J_V={sn['J_V']:.3e} flip={sn['g_flip_frac']:.4f}")
 
-    fin = exact_state(Bp, Yp, TAR, mom, lam, Bg)
+    B_out, Y_out, best_step = Bp.detach(), Yp.detach(), None
+    if snapshot_best and best["B"] is not None:
+        B_out, Y_out, best_step = best["B"], best["Y"], best["step"]
+    fin = exact_state(B_out, Y_out, TAR, mom, lam, Bg)
+    B_out, Y_out = B_out.float().clone(), Y_out.float().clone()
     verbose(f"  [fit lip m={m}] {status} J={fin['J']:.6e} J_M={fin['J_M']:.3e} "
             f"J_V={fin['J_V']:.3e} J0={curve['J'][0]:.3e} "
-            f"({time.time() - t0:.0f}s)")
+            + (f"(best snapshot step {best_step}) " if best_step is not None
+               else "") + f"({time.time() - t0:.0f}s)")
     return dict(status=status, diverged_at=diverged_at, curve=curve,
-                B=Bp.detach().float().clone(), Yat=Yp.detach().float().clone(),
+                B=B_out, Yat=Y_out, best_step=best_step,
                 **{f"final_{k}": v for k, v in fin.items()}, **mom)
 
 
@@ -261,8 +296,47 @@ def selftest():
                 verbose=lambda *a: None)
     assert f["status"] == "ok" and f["final_J"] < 0.5 * st["J"], \
         f"fit did not improve: {f['final_J']} vs {st['J']}"
+
+    # 6. mb estimator is unbiased: E[minibatch loss] == exact J (the target-
+    #    quadratic part is the S constants; sampled terms are linear in the
+    #    target measure).  Monte-Carlo mean vs 4-sigma band.
+    lam = 0.4
+    Jx, _, _ = _J_terms(B, Yat, masks(B, Bg), TAR["Z"], TAR["Y"], TAR["w"],
+                        TAR["G"], mom["S_M"], mom["S_V"], lam)
+    draws = []
+    w_mb = torch.full((8,), 1.0 / 8, dtype=torch.float64)
+    for _ in range(4000):
+        idx = torch.multinomial(TAR["w"], 8, replacement=True)
+        Jd, _, _ = _J_terms(B, Yat, masks(B, Bg), TAR["Z"][idx],
+                            TAR["Y"][idx], w_mb, TAR["G"][idx],
+                            mom["S_M"], mom["S_V"], lam)
+        draws.append(float(Jd.item()))
+    dr = torch.tensor(draws)
+    se = float(dr.std().item()) / len(draws) ** 0.5
+    assert abs(float(dr.mean().item()) - float(Jx.item())) < 4 * se, \
+        f"mb estimator biased: {dr.mean().item()} vs {Jx.item()} (se {se})"
+
+    # 7. jitter fit still improves the TRUE exact J (reported curve is always
+    #    against the un-jittered full target)
+    fj = fit_lip(TAR, B, Yat, Bg, steps=300, fit_lr=1e-2, lam=0.5,
+                 eval_every=100, adam_eps=1e-8, dtype=torch.float64,
+                 jitter=0.1, verbose=lambda *a: None)
+    assert fj["status"] == "ok" and fj["final_J"] < 0.5 * st["J"], \
+        f"jitter fit did not improve: {fj['final_J']} vs {st['J']}"
+
+    # 8. snapshot_best returns the min of the exact-J curve
+    fs = fit_lip(TAR, B, Yat, Bg, steps=300, fit_lr=1e-2, lam=0.5,
+                 eval_every=50, adam_eps=1e-8, dtype=torch.float64,
+                 snapshot_best=True, verbose=lambda *a: None)
+    ok(fs["final_J"], min(fs["curve"]["J"]), "snapshot_best == curve min",
+       tol=1e-12)
+    st_b = exact_state(fs["B"].double(), fs["Yat"].double(), TAR, mom, 0.5, Bg)
+    ok(st_b["J"], fs["final_J"], "snapshot_best atoms match reported J",
+       tol=1e-6)   # fp32 round-trip of the returned atoms
+
     print(f"[lip_fit selftest] ALL OK (fit J {st['J']:.3e} -> "
-          f"{f['final_J']:.3e} in 300 steps)")
+          f"{f['final_J']:.3e}; mb unbiased within {se:.1e}; jitter fit "
+          f"{fj['final_J']:.3e}; snapshot best step {fs['best_step']})")
 
 
 if __name__ == "__main__":
