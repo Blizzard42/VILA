@@ -31,6 +31,17 @@ the cached features, sigma in per-dim std units of the seen cache), head_l2
 ALL trainable head params to the mean-MSE loss, so the minimizer matches the
 analytic solve's sum-SE + gamma*||W||^2 objective; CSV train_loss stays pure
 MSE).
+
+Wave 19 keys: head_solve ("sgd" default | "analytic": vila-mimic only,
+replaces _train_head with VILA's exact math on the cached features — task-0
+ridge (HtH + gamma I)^-1 HtY with gamma = head_l2 if > 0 else CV'd by the
+vila.py 80/20 grid, later tasks RLS on the new-task cache carrying R; float64
+throughout, one CSV row per task with the full-seen-cache train MSE/acc);
+head_task0_scale (multiply the last-layer weight by this once after the
+task-0 fit, both solve modes — VILA's hard-coded 0.9); head_proj_seed
+(vila-mimic only: re-draw fc0 from its own CPU generator with this seed,
+same U(-1/sqrt(d), 1/sqrt(d)) law as nn.Linear's default init; unset =
+bit-identical to previous waves).
 """
 import logging
 
@@ -58,6 +69,18 @@ class VilaMimicHead(nn.Module):
     def __init__(self, in_features, args, device):
         super().__init__()
         self.fc0 = nn.Linear(in_features, args["Hidden"], bias=False, device=device)
+        proj_seed = args.get("head_proj_seed", 0)
+        if proj_seed:
+            # nn.Linear default init is kaiming_uniform_(a=sqrt(5)) =
+            # U(-1/sqrt(fan_in), 1/sqrt(fan_in)) for a bias-free layer;
+            # redraw from an own-seed CPU generator so the draw is decoupled
+            # from the global seed stream
+            g = torch.Generator().manual_seed(int(proj_seed))
+            bound = 1.0 / in_features ** 0.5
+            w = torch.empty(args["Hidden"], in_features)
+            w.uniform_(-bound, bound, generator=g)
+            with torch.no_grad():
+                self.fc0.weight.copy_(w)
         self.fc0.weight.requires_grad_(False)
         drop = args.get("head_dropout", 0.0)
         self.drop = nn.Dropout(drop) if drop > 0 else nn.Identity()
@@ -262,6 +285,8 @@ class Learner(VilaLearner):
         self.head_l2 = args.get("head_l2", 0.0)
         self.head_batch_size = args.get("head_batch_size", 4096)
         self.head_eval_every = args.get("head_eval_every", 0)
+        self.head_solve = args.get("head_solve", "sgd")
+        self.head_task0_scale = args.get("head_task0_scale", 1.0)
         # CSVs land next to trainer.py's log file, same naming scheme
         init_cls = 0 if args["init_cls"] == args["increment"] else args["init_cls"]
         stem = "logs/{}/{}/{}/{}/{}_{}_{}".format(
@@ -295,8 +320,15 @@ class Learner(VilaLearner):
                 in_features, self.args, self._device)
             self._network.ac_model = self.head  # eval flows through it unchanged
         self.head.append_task(self._total_classes - self._known_classes)
+        n_prev = 0 if self._seen_feats is None else self._seen_feats.shape[0]
         self._cache_task_features()
-        self._train_head()
+        if self.head_solve == "analytic":
+            self._solve_head_analytic(n_prev)
+        else:
+            self._train_head()
+            if self._cur_task == 0 and self.head_task0_scale != 1.0:
+                with torch.no_grad():
+                    self.head.head.weight.mul_(self.head_task0_scale)
 
     @torch.no_grad()
     def _cache_task_features(self):
@@ -413,3 +445,81 @@ class Learner(VilaLearner):
                         self._cur_task, epoch, self.head_epochs, lr_now,
                         train_loss, train_acc, test_acc))
         self.head.eval()
+
+    @torch.no_grad()
+    def _hidden(self, feats):
+        """vila-mimic's frozen expansion h = relu(fc0 x), float64, batched."""
+        out = []
+        for i in range(0, feats.shape[0], self.head_batch_size):
+            out.append(F.relu(self.head.fc0(feats[i:i + self.head_batch_size])).double())
+        return torch.cat(out)
+
+    @torch.no_grad()
+    def _optimise_gamma(self, H, Y):
+        """vila.py optimise_ridge_parameter port: fit on the first 80%,
+        score MSE on the last 20%, grid 10^-8..10^8."""
+        ridges = 10.0 ** np.arange(-8, 9)
+        n_fit = int(H.shape[0] * 0.8)
+        Q = H[:n_fit].T @ Y[:n_fit]
+        G = H[:n_fit].T @ H[:n_fit]
+        eye = torch.eye(G.shape[0], dtype=G.dtype, device=G.device)
+        losses = []
+        for ridge in ridges:
+            Wo = torch.linalg.solve(G + ridge * eye, Q)
+            losses.append(F.mse_loss(H[n_fit:] @ Wo, Y[n_fit:]).item())
+        gamma = float(ridges[int(np.argmin(losses))])
+        logging.info("analytic head: CV-selected gamma {}".format(gamma))
+        return gamma
+
+    @torch.no_grad()
+    def _solve_head_analytic(self, n_prev):
+        """VILA's exact head math on the cached features (vila-mimic only):
+        task 0 = ridge solve (+ head_task0_scale), later tasks = RLS over the
+        NEW task's cache carrying R — vila.py _cls_align/_IL_align, but in
+        float64 and on the same single-augmentation-draw cache the SGD arms
+        train on."""
+        assert isinstance(self.head, VilaMimicHead), \
+            "head_solve=analytic requires head_model=vila-mimic"
+        new_H = self._hidden(self._seen_feats[n_prev:])
+        new_Y = F.one_hot(self._seen_labels[n_prev:],
+                          self._total_classes).double()
+        k = new_H.shape[1]
+        if self._cur_task == 0:
+            gamma = self.head_l2 if self.head_l2 > 0 else \
+                self._optimise_gamma(new_H, new_Y)
+            self._an_gamma = gamma
+            eye = torch.eye(k, dtype=new_H.dtype, device=new_H.device)
+            R = torch.linalg.inv(new_H.T @ new_H + gamma * eye)
+            W = self.head_task0_scale * (R @ (new_H.T @ new_Y))
+        else:
+            # head.append_task zero-padded the new-class rows, mirroring
+            # VILA's update_fc; RLS updates W with new data only
+            W = self.head.head.weight.detach().double().t()
+            R = self._an_R
+            for i in range(0, new_H.shape[0], self.head_batch_size):
+                Hb = new_H[i:i + self.head_batch_size]
+                Yb = new_Y[i:i + self.head_batch_size]
+                eye_b = torch.eye(Hb.shape[0], dtype=Hb.dtype, device=Hb.device)
+                R = R - R @ Hb.T @ torch.linalg.inv(
+                    eye_b + Hb @ R @ Hb.T) @ Hb @ R
+                W = W + R @ Hb.T @ (Yb - Hb @ W)
+        self._an_R = R
+        self.head.head.weight.copy_(W.t().float())
+        # one CSV row per task: full-seen-cache metrics, epoch 0, lr 0
+        H_all = self._hidden(self._seen_feats)
+        logits = H_all @ W
+        Y_all = F.one_hot(self._seen_labels, self._total_classes).double()
+        train_loss = F.mse_loss(logits, Y_all).item()
+        train_acc = (logits.argmax(dim=1)
+                     == self._seen_labels).double().mean().item()
+        test_acc = ""
+        if self.head_eval_every > 0:
+            text_features = self._feat_from_temp()
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            test_acc = self._eval_cached(text_features)
+        print(self._cur_task, 0, 0.0, train_loss, train_acc, test_acc,
+              file=self._head_log, sep=",")
+        logging.info(
+            "task {} analytic solve gamma {} train_mse {:.6f} train_acc "
+            "{:.4f} test_acc {}".format(self._cur_task, self._an_gamma,
+                                        train_loss, train_acc, test_acc))
