@@ -36,6 +36,7 @@ fp DISCIPLINE: fit steps run fp32 (mask Grams are exact in fp32: entries 0/1,
 integer inner products <= k << 2^24); every REPORTED J is an exact fp64 eval
 of the stored state, and a negative squared error aborts (PrecisionError).
 """
+import math
 import time
 
 import torch
@@ -149,7 +150,7 @@ def _rms(t):
 
 def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
             dtype=torch.float32, mb=0, jitter=0.0, snapshot_best=False,
-            verbose=print):
+            sched="const", snap_steps=(), wm_chunk=8192, verbose=print):
     """One LIP fit: Adam on free natural-scale (atoms, targets), init (B0, Y0)
     -- the warm start IS the init (no redraw, no Y* solve) -- minimizing the
     exact full-batch J against the weighted target.  RELATIVE lr: each param
@@ -166,19 +167,36 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
                   the target (distills a smoothed distribution).
     snapshot_best return the atoms from the best exact-J snapshot (the
                   eval_every cadence) instead of the final step.
+    sched         "const" (waves 1-6) | "cosine": lr multiplier
+                  0.5*(1+cos(pi*t/steps)) -- the kip_vs_cpx fit schedule
+                  WITHOUT its 100-step warmup.
+    snap_steps    payload snapshots: at each listed step the fp32 atoms are
+                  stored and returned in `snaps` (the fit continues; under
+                  sched=cosine a mid-fit snapshot is NOT a shorter cosine fit
+                  -- its anneal never finished).
+    wm_chunk      row-chunk of the one-time wmoments pass (exact either way).
 
     The reported curve is ALWAYS the exact fp64 J of the stored state against
     the true (un-jittered, full) target.
-    -> dict(B fp32, Yat fp32, curve, status, best_step, final_*)."""
+    -> dict(B fp32, Yat fp32, curve, snaps, status, best_step, final_*)."""
     assert not torch.backends.cuda.matmul.allow_tf32, \
         "TF32 breaks the fp32 mask-Gram exactness argument"
-    mom = wmoments(TAR)
+    mom = wmoments(TAR, chunk=wm_chunk)
     Bp = B0.detach().to(dtype).clone().requires_grad_(True)
     Yp = Y0.detach().to(dtype).clone().requires_grad_(True)
     m = Bp.shape[0]
     opt = torch.optim.Adam(
         [dict(params=[Bp], lr=fit_lr * _rms(Bp)),
          dict(params=[Yp], lr=fit_lr * _rms(Yp))], eps=adam_eps)
+    assert sched in ("const", "cosine"), sched
+    scheduler = (torch.optim.lr_scheduler.LambdaLR(
+        opt, lambda t: 0.5 * (1.0 + math.cos(math.pi * min(t, steps)
+                                             / float(steps))))
+        if sched == "cosine" else None)
+    snap_set = {int(s) for s in snap_steps}
+    assert all(0 < s < steps for s in snap_set), \
+        f"snap_steps must lie inside the fit: {sorted(snap_set)} vs {steps}"
+    snaps = []
     Z_f, Y_f = TAR["Z"].to(dtype), TAR["Y"].to(dtype)
     w_f, Bg_f = TAR["w"].to(dtype), Bg.to(dtype)
     G0 = masks(Bp.detach(), Bg_f)                 # init masks, for flip drift
@@ -202,6 +220,10 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
             if snapshot_best and sn["J"] < best["J"]:
                 best.update(J=sn["J"], step=int(step),
                             B=Bp.detach().clone(), Y=Yp.detach().clone())
+            if step in snap_set:
+                snaps.append(dict(step=int(step), J=sn["J"],
+                                  B=Bp.detach().float().clone(),
+                                  Y=Yp.detach().float().clone()))
         return sn
 
     snapshot(0)
@@ -224,7 +246,9 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
-        if (t + 1) % eval_every == 0 or t == steps - 1:
+        if scheduler is not None:
+            scheduler.step()
+        if (t + 1) % eval_every == 0 or t == steps - 1 or (t + 1) in snap_set:
             sn = snapshot(t + 1)
             if (t + 1) % (10 * eval_every) == 0 or t == steps - 1:
                 verbose(f"  [fit lip m={m}] step {t + 1}/{steps} "
@@ -241,7 +265,7 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
             + (f"(best snapshot step {best_step}) " if best_step is not None
                else "") + f"({time.time() - t0:.0f}s)")
     return dict(status=status, diverged_at=diverged_at, curve=curve,
-                B=B_out, Yat=Y_out, best_step=best_step,
+                B=B_out, Yat=Y_out, best_step=best_step, snaps=snaps,
                 **{f"final_{k}": v for k, v in fin.items()}, **mom)
 
 
@@ -345,9 +369,30 @@ def selftest():
     ok(st_b["J"], fs["final_J"], "snapshot_best atoms match reported J",
        tol=1e-6)   # fp32 round-trip of the returned atoms
 
+    # 9. cosine schedule: runs clean and still improves J (lr multiplier is 0
+    #    at the horizon by construction)
+    fc = fit_lip(TAR, B, Yat, Bg, steps=300, fit_lr=1e-2, lam=0.5,
+                 eval_every=100, adam_eps=1e-8, dtype=torch.float64,
+                 sched="cosine", verbose=lambda *a: None)
+    assert fc["status"] == "ok" and fc["final_J"] < 0.5 * st["J"], \
+        f"cosine fit did not improve: {fc['final_J']} vs {st['J']}"
+
+    # 10. snap payloads: steps recorded in order; stored atoms reproduce the
+    #     curve J at that step (fp32 round-trip tolerance)
+    fp_ = fit_lip(TAR, B, Yat, Bg, steps=300, fit_lr=1e-2, lam=0.5,
+                  eval_every=50, adam_eps=1e-8, dtype=torch.float64,
+                  snap_steps=(120, 200), verbose=lambda *a: None)
+    assert [s["step"] for s in fp_["snaps"]] == [120, 200], fp_["snaps"]
+    for s in fp_["snaps"]:
+        i = fp_["curve"]["step"].index(s["step"])
+        ok(s["J"], fp_["curve"]["J"][i], f"snap J curve@{s['step']}", tol=1e-12)
+        st_s = exact_state(s["B"].double(), s["Y"].double(), TAR, mom, 0.5, Bg)
+        ok(st_s["J"], s["J"], f"snap atoms J@{s['step']}", tol=1e-6)
+
     print(f"[lip_fit selftest] ALL OK (fit J {st['J']:.3e} -> "
           f"{f['final_J']:.3e}; mb unbiased within {se:.1e}; jitter fit "
-          f"{fj['final_J']:.3e}; snapshot best step {fs['best_step']})")
+          f"{fj['final_J']:.3e}; snapshot best step {fs['best_step']}; "
+          f"cosine {fc['final_J']:.3e}; {len(fp_['snaps'])} snap payloads)")
 
 
 if __name__ == "__main__":

@@ -68,6 +68,17 @@ class Learner(UpperboundLearner):
         self.lip_fit_snapshot_best = args.get("lip_fit_snapshot_best", False)
         self.lip_fit_init = args.get("lip_fit_init", "warm")
         assert self.lip_fit_init in ("warm", "rand"), self.lip_fit_init
+        # wave-7 knobs (defaults reproduce waves 1-6 exactly)
+        self.lip_fit_sched = args.get("lip_fit_sched", "const")
+        self.lip_centred_y = args.get("lip_centred_y", False)
+        ss = args.get("lip_snap_steps", []) or []
+        if isinstance(ss, str):                # "12000,24000" (glob-safe form)
+            ss = [x for x in ss.split(",") if x]
+        self.lip_snap_steps = [int(x) for x in ss]
+        self.memory_save = args.get("memory_save", False)
+        self.head_from_memory = args.get("head_from_memory", "")
+        self.head_from_snap = int(args.get("head_from_snap", 0))  # 0 = final
+        self.head_budget_mult = int(args.get("head_budget_mult", 1))
         if self.memory_mode == "joint":
             assert self.lip_fit_mb > 0, \
                 "joint mode fits a full-dataset target: mb estimator required"
@@ -79,6 +90,7 @@ class Learner(UpperboundLearner):
             stem = "logs/{}/{}/{}/{}/{}_{}_{}".format(
                 args["model_name"], args["dataset"], init_cls, args["increment"],
                 args["prefix"], args["seed"], args["backbone_type"])
+            self._stem = stem
             self._lip_log = open(stem + "_lip_curves.csv", "w", buffering=1)
             print("task", *LIP_CURVE, file=self._lip_log, sep=",")
 
@@ -114,15 +126,46 @@ class Learner(UpperboundLearner):
             # the head never trains until the final task, where the full seen
             # data is distilled in ONE fit and a never-trained head trains on
             # the memory alone, step-matched to the recursive final task.
+            # Wave 7 additions: lip_centred_y (target = one-hot - pi, the
+            # exp_1 convention; balanced classes make argmax invariant),
+            # lip_snap_steps (mid-fit memories, each trained on a FRESH head,
+            # tasks 71,72,... in the head CSV), memory_save (payload .pt),
+            # head_from_memory (stage B: no cache, no fit -- load a payload
+            # and train the head alone).
+            if self.head_from_memory:
+                if last:
+                    self._head_from_memory()
+                return
             self._cache_task_features()
             self._seen_count = self._seen_feats.shape[0]
             if last:
                 m, C = self.memory_m, self._total_classes
                 X = self._seen_feats
                 Y = F.one_hot(self._seen_labels, C).double()
+                pi = None
+                if self.lip_centred_y:
+                    pi = Y.mean(dim=0)         # class priors of the seen rows
+                    Y = Y - pi
                 draw = torch.randperm(X.shape[0], device=self._device)[:m]
-                self._fit_memory([(X.double(), Y, 1.0)],
-                                 X[draw], Y[draw].float(), "joint")
+                fit = self._fit_memory([(X.double(), Y, 1.0)],
+                                       X[draw], Y[draw].float(), "joint")
+                if self.memory_save:
+                    allsn = fit["snaps"] + [dict(step=self.lip_fit_steps,
+                                                 J=fit["final_J"], B=fit["B"],
+                                                 Y=fit["Yat"])]
+                    torch.save(dict(Bg=self.head.Bg.detach().cpu(),
+                                    seen_count=int(self._seen_count),
+                                    centred=bool(self.lip_centred_y),
+                                    pi=None if pi is None else pi.cpu(),
+                                    snaps=[dict(step=s["step"], J=s["J"],
+                                                B=s["B"].cpu(), Y=s["Y"].cpu())
+                                           for s in allsn]),
+                               self._stem + "_memory.pt")
+                    logging.info("memory payload ({} snaps) -> {}".format(
+                        len(allsn), self._stem + "_memory.pt"))
+                for i, s in enumerate(fit["snaps"]):
+                    self._train_snap_head(s["B"].to(self._device),
+                                          s["Y"].to(self._device), 71 + i)
                 self._seen_feats, self._seen_labels = self._mem_X, self._mem_Y
                 self._train_head()
             return
@@ -144,6 +187,46 @@ class Learner(UpperboundLearner):
             if last and self.final_fresh_retrain:
                 self._fresh_retrain()
         self._seen_feats = self._seen_labels = None  # the cache is gone
+
+    def _train_snap_head(self, X, Y, marker):
+        """Train a FRESH head (new W1 draw, zeroed output, SAME Bg -- the
+        memory lives in this run's gate space) on one mid-fit memory
+        snapshot, logged under `marker` in the head CSV; then restore the
+        original never-trained head for the final memory's own training."""
+        logging.info("snapshot head training (task marker {})".format(marker))
+        orig, ct = self.head, self._cur_task
+        in_features = self.feature_dim + self._network.clip.out_dim
+        head = HEADS[self.args.get("head_model", "vila-mimic")](
+            in_features, self.args, self._device)
+        head.Bg.copy_(orig.Bg)
+        head.append_task(self._total_classes)
+        self.head = self._network.ac_model = head
+        self._seen_feats, self._seen_labels, self._cur_task = X, Y, marker
+        try:
+            self._train_head()
+        finally:
+            self.head, self._network.ac_model, self._cur_task = orig, orig, ct
+
+    def _head_from_memory(self):
+        """Stage B (wave 7): load a saved memory payload, adopt its Bg (the
+        atoms were distilled against it), pick one snapshot by step
+        (head_from_snap, 0 = the final one), and train the head on it with
+        the step-matched budget x head_budget_mult.  No caching, no fit."""
+        pay = torch.load(self.head_from_memory, map_location="cpu")
+        snaps = {int(s["step"]): s for s in pay["snaps"]}
+        step = self.head_from_snap or max(snaps)
+        s = snaps[step]
+        with torch.no_grad():
+            self.head.Bg.copy_(pay["Bg"].to(self._device))
+        self._seen_count = int(pay["seen_count"])
+        self._seen_feats = s["B"].to(self._device)
+        self._seen_labels = s["Y"].to(self._device)
+        logging.info("head_from_memory: {} snap step {} ({} rows, centred={},"
+                     " budget x{})".format(self.head_from_memory, step,
+                                           self._seen_feats.shape[0],
+                                           pay.get("centred"),
+                                           self.head_budget_mult))
+        self._train_head()
 
     def _fresh_retrain(self):
         """Control (wave 6): rebuild the head -- fresh W1 draw, zeroed output
@@ -229,6 +312,9 @@ class Learner(UpperboundLearner):
                       adam_eps=self.lip_fit_adam_eps,
                       mb=self.lip_fit_mb, jitter=self.lip_fit_jitter,
                       snapshot_best=self.lip_fit_snapshot_best,
+                      sched=self.lip_fit_sched,
+                      snap_steps=self.lip_snap_steps,
+                      wm_chunk=2048 if TAR["Z"].shape[0] > 20000 else 8192,
                       verbose=lambda s: logging.info(s.strip()))
         if fit["status"] != "ok":
             raise RuntimeError("lip fit diverged at task {} step {}".format(
@@ -237,6 +323,7 @@ class Learner(UpperboundLearner):
         for i in range(len(fit["curve"]["step"])):
             print(self._cur_task, *[fit["curve"][k][i] for k in LIP_CURVE],
                   file=self._lip_log, sep=",")
+        return fit
 
     # ---------------------------------------------------------------- train
     def _train_head(self):
@@ -245,7 +332,8 @@ class Learner(UpperboundLearner):
         the actual training set; (2) targets may be soft fp32 rows (lip)."""
         n = self._seen_feats.shape[0]
         bs = self.head_batch_size
-        steps_target = self.head_epochs * ((self._seen_count + bs - 1) // bs)
+        steps_target = (self.head_budget_mult * self.head_epochs
+                        * ((self._seen_count + bs - 1) // bs))
         steps_per_epoch = (n + bs - 1) // bs
         epochs = (steps_target + steps_per_epoch - 1) // steps_per_epoch
         soft = self._seen_labels.dtype.is_floating_point
