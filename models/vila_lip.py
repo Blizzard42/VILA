@@ -51,10 +51,11 @@ class Learner(UpperboundLearner):
     def __init__(self, args):
         super().__init__(args)
         self.memory_mode = args.get("memory_mode", "lip")
-        assert self.memory_mode in ("lip", "coreset"), self.memory_mode
-        if self.memory_mode == "lip":
+        assert self.memory_mode in ("lip", "coreset", "joint"), self.memory_mode
+        if self.memory_mode in ("lip", "joint"):
             assert args.get("head_model") == "agalu", \
                 "lip memory prices the AGaLU feature space (needs head.Bg)"
+        self.final_fresh_retrain = args.get("final_fresh_retrain", False)
         self.memory_m = args.get("memory_m", 500)
         self.lip_fit_steps = args.get("lip_fit_steps", 48000)
         self.lip_fit_lr = args.get("lip_fit_lr", 1e-3)
@@ -67,10 +68,13 @@ class Learner(UpperboundLearner):
         self.lip_fit_snapshot_best = args.get("lip_fit_snapshot_best", False)
         self.lip_fit_init = args.get("lip_fit_init", "warm")
         assert self.lip_fit_init in ("warm", "rand"), self.lip_fit_init
+        if self.memory_mode == "joint":
+            assert self.lip_fit_mb > 0, \
+                "joint mode fits a full-dataset target: mb estimator required"
         self._seen_count = 0            # real rows seen so far (the weights)
         self._mem_X = self._mem_Y = None  # Y: fp32 [m, C] (lip) | int labels
         self._lip_log = None
-        if self.memory_mode == "lip":
+        if self.memory_mode in ("lip", "joint"):
             init_cls = 0 if args["init_cls"] == args["increment"] else args["init_cls"]
             stem = "logs/{}/{}/{}/{}/{}_{}_{}".format(
                 args["model_name"], args["dataset"], init_cls, args["increment"],
@@ -104,6 +108,25 @@ class Learner(UpperboundLearner):
             self._network.ac_model = self.head
         self.head.append_task(self._total_classes - self._known_classes)
 
+        last = self._cur_task == data_manager.nb_tasks - 1
+        if self.memory_mode == "joint":
+            # STEP-ABLATION (wave 6): keep the WHOLE cache (parent append);
+            # the head never trains until the final task, where the full seen
+            # data is distilled in ONE fit and a never-trained head trains on
+            # the memory alone, step-matched to the recursive final task.
+            self._cache_task_features()
+            self._seen_count = self._seen_feats.shape[0]
+            if last:
+                m, C = self.memory_m, self._total_classes
+                X = self._seen_feats
+                Y = F.one_hot(self._seen_labels, C).double()
+                draw = torch.randperm(X.shape[0], device=self._device)[:m]
+                self._fit_memory([(X.double(), Y, 1.0)],
+                                 X[draw], Y[draw].float(), "joint")
+                self._seen_feats, self._seen_labels = self._mem_X, self._mem_Y
+                self._train_head()
+            return
+
         # capture ONLY the new task's rows (the cache; parent concatenates)
         self._seen_feats = self._seen_labels = None
         self._cache_task_features()
@@ -118,7 +141,28 @@ class Learner(UpperboundLearner):
             self._update_memory(new_X, new_y, N_prev)  # compress FIRST (B.4)
             self._seen_feats, self._seen_labels = self._mem_X, self._mem_Y
             self._train_head()                       # memory alone
+            if last and self.final_fresh_retrain:
+                self._fresh_retrain()
         self._seen_feats = self._seen_labels = None  # the cache is gone
+
+    def _fresh_retrain(self):
+        """Control (wave 6): rebuild the head -- fresh W1 draw, zeroed output
+        -- but COPY Bg (the memory was distilled in the old head's gate
+        space), then train it on the final memory with the same step-matched
+        budget.  Logged as task 99 in the head curves CSV."""
+        logging.info("final fresh-head retrain on the memory (task 99)")
+        old_Bg = self.head.Bg
+        in_features = self.feature_dim + self._network.clip.out_dim
+        self.head = HEADS[self.args.get("head_model", "vila-mimic")](
+            in_features, self.args, self._device)
+        self.head.Bg.copy_(old_Bg)
+        self.head.append_task(self._total_classes)
+        self._network.ac_model = self.head
+        ct, self._cur_task = self._cur_task, 99
+        try:
+            self._train_head()
+        finally:
+            self._cur_task = ct
 
     # ---------------------------------------------------------------- memory
     def _update_memory(self, new_X, new_y, N_prev):
@@ -172,10 +216,13 @@ class Learner(UpperboundLearner):
             B0 = (allZ.mean(0) + allZ.std(0)                  # Gaussian atoms
                   * torch.randn(m, allZ.shape[1], device=self._device))
             Y0 = 0.01 * torch.randn(m, C, device=self._device)
+        self._fit_memory(parts, B0, Y0, "w_old={:.4f}".format(w_old))
+
+    def _fit_memory(self, parts, B0, Y0, note):
         TAR = make_target(parts, self.head.Bg)
-        logging.info("task {} lip fit: target {} rows (w_old={:.4f}), m={}, "
-                     "{} steps".format(self._cur_task, TAR["Z"].shape[0],
-                                       w_old, m, self.lip_fit_steps))
+        logging.info("task {} lip fit: target {} rows ({}), m={}, {} steps"
+                     .format(self._cur_task, TAR["Z"].shape[0], note,
+                             self.memory_m, self.lip_fit_steps))
         fit = fit_lip(TAR, B0, Y0, self.head.Bg, steps=self.lip_fit_steps,
                       fit_lr=self.lip_fit_lr, lam=self.lip_lambda_mv,
                       eval_every=self.lip_fit_eval_every,

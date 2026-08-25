@@ -92,13 +92,19 @@ def make_target(parts, Bg):
     return dict(Z=Z, Y=Y, w=w, G=masks(Z, Bg.double()))
 
 
-def wmoments(TAR):
+def wmoments(TAR, chunk=8192):
     """S_M = ||M||_F^2, S_V = ||V||_F^2 of the weighted target, exact fp64:
-    S_M = sum_ab w_a w_b k(a,b)^2,  S_V = sum_ab w_a w_b (Y_a.Y_b) k(a,b)."""
-    K = k_agalu(TAR["Z"], TAR["Z"], TAR["G"], TAR["G"])
-    W = TAR["w"][:, None] * TAR["w"][None, :]
-    return dict(S_M=float((W * K * K).sum().item()),
-                S_V=float((W * (TAR["Y"] @ TAR["Y"].T) * K).sum().item()))
+    S_M = sum_ab w_a w_b k(a,b)^2,  S_V = sum_ab w_a w_b (Y_a.Y_b) k(a,b).
+    Row-chunked so a joint 50k-row target never materializes the n x n Gram;
+    chunking only reorders exact fp64 partial sums."""
+    Z, Y, w, G = TAR["Z"], TAR["Y"], TAR["w"], TAR["G"]
+    S_M = S_V = 0.0
+    for i in range(0, Z.shape[0], chunk):
+        K = k_agalu(Z[i:i + chunk], Z, G[i:i + chunk], G)
+        W = w[i:i + chunk, None] * w[None, :]
+        S_M += float((W * K * K).sum().item())
+        S_V += float((W * (Y[i:i + chunk] @ Y.T) * K).sum().item())
+    return dict(S_M=S_M, S_V=S_V)
 
 
 # ================================================================ objective
@@ -271,6 +277,11 @@ def selftest():
     M, V = explicit(TAR["Z"], TAR["Y"], TAR["w"])
     ok(mom["S_M"], float((M * M).sum().item()), "S_M explicit")
     ok(mom["S_V"], float((V * V).sum().item()), "S_V explicit")
+
+    # 1b. chunked wmoments == unchunked (pure re-ordering of exact sums)
+    mom13 = wmoments(TAR, chunk=13)
+    ok(mom13["S_M"], mom["S_M"], "S_M chunked", tol=1e-12)
+    ok(mom13["S_V"], mom["S_V"], "S_V chunked", tol=1e-12)
 
     # 2. moment stacking: mixture target == w1*M(part1) + w2*M(part2)
     M1, V1 = explicit(Z1, Y1, torch.full((40,), 1 / 40, dtype=torch.float64))
