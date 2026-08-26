@@ -133,6 +133,7 @@ class Learner(UpperboundLearner):
             # head_from_memory (stage B: no cache, no fit -- load a payload
             # and train the head alone).
             if self.head_from_memory:
+                self._cache_test_features()   # eval set only, no train cache
                 if last:
                     self._head_from_memory()
                 return
@@ -187,6 +188,31 @@ class Learner(UpperboundLearner):
             if last and self.final_fresh_retrain:
                 self._fresh_retrain()
         self._seen_feats = self._seen_labels = None  # the cache is gone
+
+    def _cache_test_features(self):
+        """The TEST half of the parent's _cache_task_features, alone:
+        head_from_memory runs skip the train cache but the per-epoch eval
+        (_eval_cached) still needs the accumulated clean test features."""
+        if self.head_eval_every <= 0:
+            return
+        self._network.to(self._device)
+        self._network.eval()
+        new_test = self.data_manager.get_dataset(
+            np.arange(self._known_classes, self._total_classes),
+            source="test", mode="test")
+        loader = DataLoader(new_test, batch_size=self.batch_size,
+                            shuffle=False, num_workers=num_workers)
+        feats, labels = [], []
+        for _, data, clip_data, label in loader:
+            feats.append(self.head.preprocess(
+                self._network, data.to(self._device),
+                clip_data.to(self._device)))
+            labels.append(label.to(self._device))
+        feats, labels = torch.cat(feats), torch.cat(labels)
+        self._test_feats = (feats if self._test_feats is None
+                            else torch.cat([self._test_feats, feats]))
+        self._test_labels = (labels if self._test_labels is None
+                             else torch.cat([self._test_labels, labels]))
 
     def _train_snap_head(self, X, Y, marker):
         """Train a FRESH head (new W1 draw, zeroed output, SAME Bg -- the
