@@ -330,7 +330,8 @@ class Learner(UpperboundLearner):
 
     def _fit_memory(self, parts, B0, Y0, note):
         gate = (getattr(self.head, "gate_act", "step"),
-                float(getattr(self.head, "gate_scale", 1.0)))
+                float(getattr(self.head, "gate_scale", 1.0)),
+                float(getattr(self.head, "gate_alpha", 1.0)))
         TAR = make_target(parts, self.head.Bg, gate=gate)
         logging.info("task {} lip fit: target {} rows ({}), m={}, {} steps"
                      .format(self._cur_task, TAR["Z"].shape[0], note,

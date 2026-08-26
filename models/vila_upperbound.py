@@ -158,15 +158,16 @@ class AGaLUHead(nn.Module):
         self.head = nn.Linear(kh, 0, bias=False, device=device)
         self.gate_act = args.get("gate_act", "step")
         assert self.gate_act in GATE_ACTS, self.gate_act
+        self.gate_alpha = float(args.get("gate_alpha", 1.0))
         self.register_buffer("gate_scale",
                              torch.ones((), dtype=torch.float32, device=device))
 
     @torch.no_grad()
     def set_gate_scale(self, feats):
-        """gate_norm: divide gates by the rms of act(Bg z) over the given
-        rows (the task-0 cache) -- ONE run-level constant, shared with the
-        LIP fit so memory and head live in the same feature space."""
-        g = GATE_ACTS[self.gate_act](feats @ self.Bg.T)
+        """gate_norm: divide gates by the rms of act(alpha Bg z) over the
+        given rows (the task-0 cache) -- ONE run-level constant, shared with
+        the LIP fit so memory and head live in the same feature space."""
+        g = GATE_ACTS[self.gate_act](self.gate_alpha * (feats @ self.Bg.T))
         self.gate_scale.copy_(g.pow(2).mean().sqrt())
 
     @torch.no_grad()
@@ -183,7 +184,8 @@ class AGaLUHead(nn.Module):
         self.head = new
 
     def forward(self, features):
-        g = GATE_ACTS[self.gate_act](features @ self.Bg.T) / self.gate_scale
+        g = GATE_ACTS[self.gate_act](
+            self.gate_alpha * (features @ self.Bg.T)) / self.gate_scale
         h = g * (features @ self.W1.T)
         return {"buffer_feature": h, "logits": self.head(self.drop(h))}
 

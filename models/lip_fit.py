@@ -69,13 +69,15 @@ GATE_ACTS = {
 }
 
 
-def gates(X, Bg, act="step", scale=1.0):
-    """g = act(Bg x)/scale.  act='step' returns the classic bool mask (scale
-    ignored there would break exactness bookkeeping -- step is never scaled);
-    other acts return real-valued gates at X's dtype."""
+def gates(X, Bg, act="step", scale=1.0, alpha=1.0):
+    """g = act(alpha * Bg x)/scale.  act='step' returns the classic bool mask
+    (alpha/scale ignored: step is scale-invariant and never rescaled); other
+    acts return real-valued gates at X's dtype.  alpha is the preactivation
+    gain (wave 11): it changes the gate SHAPE regime (small -> constant-like,
+    large -> step-like)."""
     if act == "step":
         return masks(X, Bg)
-    return GATE_ACTS[act](X @ Bg.T.to(X.dtype)) / scale
+    return GATE_ACTS[act](alpha * (X @ Bg.T.to(X.dtype))) / scale
 
 
 def _gram(GA, GB, out_dtype):
@@ -108,8 +110,8 @@ def make_target(parts, Bg, gate=("step", 1.0)):
     """Weighted fit target from (Z, Y, w_total) parts: rows fp64, per-row
     weights w_part/n_part (sum over all parts = 1), gates derived once (the
     target rows never move).  parts = [(Z [n,d], Y [n,C], w_total), ...].
-    gate = (act, scale): step -> bool masks (waves 1-9 bit-identical), else
-    real-valued fp64 gates act(Bg z)/scale."""
+    gate = (act, scale[, alpha]): step -> bool masks (waves 1-9
+    bit-identical), else real-valued fp64 gates act(alpha Bg z)/scale."""
     Zs, Ys, ws = [], [], []
     for Z, Y, w in parts:
         n = Z.shape[0]
@@ -235,7 +237,8 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
     snaps = []
     Z_f, Y_f = TAR["Z"].to(dtype), TAR["Y"].to(dtype)
     w_f, Bg_f = TAR["w"].to(dtype), Bg.to(dtype)
-    g_act, g_scale = TAR.get("gate", ("step", 1.0))
+    g_act, g_scale, *g_al = TAR.get("gate", ("step", 1.0))
+    g_alpha = g_al[0] if g_al else 1.0
     assert not ste or g_act == "step", "STE is a step-gate gradient surrogate"
     G0 = masks(Bp.detach(), Bg_f)      # init sign masks, for the flip metric
     Z_std = Z_f.std(dim=0) if jitter > 0 else None
@@ -272,14 +275,14 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
             Z_t, Y_t, G_t, w_t = Z_f[idx], Y_f[idx], TAR["G"][idx], w_mb
         if jitter > 0:
             Z_t = Z_t + jitter * Z_std * torch.randn_like(Z_t)
-            G_t = gates(Z_t, Bg_f, g_act, g_scale)   # jittered gates (tied)
+            G_t = gates(Z_t, Bg_f, g_act, g_scale, g_alpha)  # tied jitter
         if ste:
             z_pre = Bp @ Bg_f.T
             s = torch.sigmoid(z_pre)              # forward = step, backward =
             G_B = ((z_pre > 0).to(dtype) - s).detach() + s   # d(sigmoid)
         else:
-            G_B = gates(Bp, Bg_f, g_act, g_scale)  # step: a.e. gradient;
-        #                                            smooth: grad flows
+            G_B = gates(Bp, Bg_f, g_act, g_scale, g_alpha)  # step: a.e.
+        #                                        gradient; smooth: grad flows
         loss, _, _ = _J_terms(Bp, Yp, G_B, Z_t, Y_t, w_t, G_t,
                               mom["S_M"], mom["S_V"], lam)
         lv = float(loss.detach().item())
@@ -436,7 +439,7 @@ def selftest():
     # 11. gate-activation generality: explicit moments == kernel machinery
     #     for a smooth scaled gate, and the fit (grad THROUGH the gates)
     #     improves the exact J
-    gt = ("tanh", 0.7)
+    gt = ("tanh", 0.7, 2.0)          # scaled AND alpha-gained gate
     TG = make_target([(Z1, Y1, 0.6), (Z2, Y2, 0.4)], Bg, gate=gt)
     momg = wmoments(TG)
     Phi = _phi(TG["Z"], TG["G"], kk)
