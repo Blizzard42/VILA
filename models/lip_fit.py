@@ -54,10 +54,37 @@ def masks(X, Bg):
     return X @ Bg.T.to(X.dtype) > 0
 
 
+# Wave-10 gate-activation suite: the step gate generalizes to any elementwise
+# act on the preactivation Bg x.  Everything downstream (kernel, J, fit) is
+# act-agnostic; step stays the bit-identical default (bool gates).
+GATE_ACTS = {
+    "step": lambda t: (t > 0).to(t.dtype),
+    "sign": torch.sign,
+    "sigmoid": torch.sigmoid,
+    "tanh": torch.tanh,
+    "identity": lambda t: t,
+    "gauss": lambda t: torch.exp(-t * t),
+    "exp": torch.exp,
+    "expm1": torch.expm1,
+}
+
+
+def gates(X, Bg, act="step", scale=1.0):
+    """g = act(Bg x)/scale.  act='step' returns the classic bool mask (scale
+    ignored there would break exactness bookkeeping -- step is never scaled);
+    other acts return real-valued gates at X's dtype."""
+    if act == "step":
+        return masks(X, Bg)
+    return GATE_ACTS[act](X @ Bg.T.to(X.dtype)) / scale
+
+
 def _gram(GA, GB, out_dtype):
-    """Binary-mask Gram, computed fp32 (exact: 0/1 entries, integer inner
-    products <= k << 2^24), cast to the caller's dtype."""
-    return (GA.float() @ GB.float().T).to(out_dtype)
+    """Gate Gram.  Bool (step) gates: computed fp32 -- exact, 0/1 entries,
+    integer inner products <= k << 2^24 -- then cast.  Real-valued gates:
+    plain matmul at the caller's dtype (fp64 on the exact path)."""
+    if GA.dtype == torch.bool:
+        return (GA.float() @ GB.float().T).to(out_dtype)
+    return (GA.to(out_dtype) @ GB.to(out_dtype).T)
 
 
 def k_agalu(A, B, GA, GB):
@@ -77,10 +104,12 @@ def _nonneg(J, parts, where, tol=1e-10):
 
 
 # ================================================================ target
-def make_target(parts, Bg):
+def make_target(parts, Bg, gate=("step", 1.0)):
     """Weighted fit target from (Z, Y, w_total) parts: rows fp64, per-row
     weights w_part/n_part (sum over all parts = 1), gates derived once (the
-    target rows never move).  parts = [(Z [n,d], Y [n,C], w_total), ...]."""
+    target rows never move).  parts = [(Z [n,d], Y [n,C], w_total), ...].
+    gate = (act, scale): step -> bool masks (waves 1-9 bit-identical), else
+    real-valued fp64 gates act(Bg z)/scale."""
     Zs, Ys, ws = [], [], []
     for Z, Y, w in parts:
         n = Z.shape[0]
@@ -90,7 +119,7 @@ def make_target(parts, Bg):
                              device=Z.device))
     Z, Y, w = torch.cat(Zs), torch.cat(Ys), torch.cat(ws)
     assert abs(float(w.sum().item()) - 1.0) < 1e-8, "target weights must sum to 1"
-    return dict(Z=Z, Y=Y, w=w, G=masks(Z, Bg.double()))
+    return dict(Z=Z, Y=Y, w=w, G=gates(Z, Bg.double(), *gate), gate=gate)
 
 
 def wmoments(TAR, chunk=8192):
@@ -126,9 +155,10 @@ def _J_terms(B, Yat, G_B, Z, Y, w, G, S_M, S_V, lam):
 
 def exact_state(B, Yat, TAR, mom, lam, Bg):
     """THE exact fp64 (M, V) evaluator: every reported J goes through
-    literally this expression.  Gates derived from the atoms (tied)."""
+    literally this expression.  Gates derived from the atoms (tied), with
+    the target's own gate activation."""
     Bd, Yd = B.detach().double(), Yat.detach().double()
-    G_B = masks(Bd, Bg.double())
+    G_B = gates(Bd, Bg.double(), *TAR.get("gate", ("step", 1.0)))
     J, J_M, J_V = _J_terms(Bd, Yd, G_B, TAR["Z"], TAR["Y"], TAR["w"],
                            TAR["G"], mom["S_M"], mom["S_V"], lam)
     J_M = _nonneg(float(J_M.item()), (mom["S_M"], 1.0), "J_M")
@@ -150,7 +180,8 @@ def _rms(t):
 
 def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
             dtype=torch.float32, mb=0, jitter=0.0, snapshot_best=False,
-            sched="const", snap_steps=(), wm_chunk=8192, verbose=print):
+            sched="const", snap_steps=(), wm_chunk=8192, ste=False,
+            verbose=print):
     """One LIP fit: Adam on free natural-scale (atoms, targets), init (B0, Y0)
     -- the warm start IS the init (no redraw, no Y* solve) -- minimizing the
     exact full-batch J against the weighted target.  RELATIVE lr: each param
@@ -175,7 +206,12 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
                   sched=cosine a mid-fit snapshot is NOT a shorter cosine fit
                   -- its anneal never finished).
     wm_chunk      row-chunk of the one-time wmoments pass (exact either way).
+    ste           straight-through estimator (step gates only): forward J is
+                  unchanged, but the atoms' gate factor backpropagates through
+                  a sigmoid surrogate instead of the frozen a.e. mask.
 
+    Gates follow TAR["gate"] = (act, scale); smooth acts are differentiable
+    in the atoms, so their gradient flows through the gate term naturally.
     The reported curve is ALWAYS the exact fp64 J of the stored state against
     the true (un-jittered, full) target.
     -> dict(B fp32, Yat fp32, curve, snaps, status, best_step, final_*)."""
@@ -199,7 +235,9 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
     snaps = []
     Z_f, Y_f = TAR["Z"].to(dtype), TAR["Y"].to(dtype)
     w_f, Bg_f = TAR["w"].to(dtype), Bg.to(dtype)
-    G0 = masks(Bp.detach(), Bg_f)                 # init masks, for flip drift
+    g_act, g_scale = TAR.get("gate", ("step", 1.0))
+    assert not ste or g_act == "step", "STE is a step-gate gradient surrogate"
+    G0 = masks(Bp.detach(), Bg_f)      # init sign masks, for the flip metric
     Z_std = Z_f.std(dim=0) if jitter > 0 else None
     w_mb = (torch.full((mb,), 1.0 / mb, dtype=dtype, device=Z_f.device)
             if mb else None)
@@ -234,8 +272,14 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
             Z_t, Y_t, G_t, w_t = Z_f[idx], Y_f[idx], TAR["G"][idx], w_mb
         if jitter > 0:
             Z_t = Z_t + jitter * Z_std * torch.randn_like(Z_t)
-            G_t = masks(Z_t, Bg_f)                # jittered gates (tied)
-        G_B = masks(Bp, Bg_f)                     # tied: a.e. gradient
+            G_t = gates(Z_t, Bg_f, g_act, g_scale)   # jittered gates (tied)
+        if ste:
+            z_pre = Bp @ Bg_f.T
+            s = torch.sigmoid(z_pre)              # forward = step, backward =
+            G_B = ((z_pre > 0).to(dtype) - s).detach() + s   # d(sigmoid)
+        else:
+            G_B = gates(Bp, Bg_f, g_act, g_scale)  # step: a.e. gradient;
+        #                                            smooth: grad flows
         loss, _, _ = _J_terms(Bp, Yp, G_B, Z_t, Y_t, w_t, G_t,
                               mom["S_M"], mom["S_V"], lam)
         lv = float(loss.detach().item())
@@ -389,10 +433,48 @@ def selftest():
         st_s = exact_state(s["B"].double(), s["Y"].double(), TAR, mom, 0.5, Bg)
         ok(st_s["J"], s["J"], f"snap atoms J@{s['step']}", tol=1e-6)
 
+    # 11. gate-activation generality: explicit moments == kernel machinery
+    #     for a smooth scaled gate, and the fit (grad THROUGH the gates)
+    #     improves the exact J
+    gt = ("tanh", 0.7)
+    TG = make_target([(Z1, Y1, 0.6), (Z2, Y2, 0.4)], Bg, gate=gt)
+    momg = wmoments(TG)
+    Phi = _phi(TG["Z"], TG["G"], kk)
+    Mg = Phi.T @ (TG["w"][:, None] * Phi)
+    Vg = Phi.T @ (TG["w"][:, None] * TG["Y"])
+    ok(momg["S_M"], float((Mg * Mg).sum().item()), "S_M tanh")
+    ok(momg["S_V"], float((Vg * Vg).sum().item()), "S_V tanh")
+    G_Bg = gates(B, Bg, *gt)
+    PhiB = _phi(B, G_Bg, kk)
+    Mh = PhiB.T @ PhiB / m
+    Vh = PhiB.T @ Yat.double() / m
+    stg = exact_state(B, Yat, TG, momg, 0.4, Bg)
+    ok(stg["J_M"], float(((Mh - Mg) ** 2).sum().item()), "J_M tanh explicit")
+    ok(stg["J_V"], float(((Vh - Vg) ** 2).sum().item()), "J_V tanh explicit")
+    fg = fit_lip(TG, B, Yat, Bg, steps=300, fit_lr=1e-2, lam=0.5,
+                 eval_every=100, adam_eps=1e-8, dtype=torch.float64,
+                 verbose=lambda *a: None)
+    assert fg["status"] == "ok" and fg["final_J"] < 0.5 * stg["J"], \
+        f"tanh fit did not improve: {fg['final_J']} vs {stg['J']}"
+
+    # 12. STE: forward J identical to the frozen-mask path at init, but the
+    #     gradient differs -- after a few steps the atoms have diverged
+    f_frz = fit_lip(TAR, B, Yat, Bg, steps=100, fit_lr=1e-2, lam=0.5,
+                    eval_every=100, adam_eps=1e-8, dtype=torch.float64,
+                    verbose=lambda *a: None)
+    f_ste = fit_lip(TAR, B, Yat, Bg, steps=100, fit_lr=1e-2, lam=0.5,
+                    eval_every=100, adam_eps=1e-8, dtype=torch.float64,
+                    ste=True, verbose=lambda *a: None)
+    ok(f_ste["curve"]["J"][0], f_frz["curve"]["J"][0], "STE J0 == frozen J0",
+       tol=1e-12)
+    d_ste = float((f_ste["B"] - f_frz["B"]).abs().max().item())
+    assert d_ste > 1e-8, "STE gradient did not diverge from the frozen mask"
+
     print(f"[lip_fit selftest] ALL OK (fit J {st['J']:.3e} -> "
           f"{f['final_J']:.3e}; mb unbiased within {se:.1e}; jitter fit "
           f"{fj['final_J']:.3e}; snapshot best step {fs['best_step']}; "
-          f"cosine {fc['final_J']:.3e}; {len(fp_['snaps'])} snap payloads)")
+          f"cosine {fc['final_J']:.3e}; {len(fp_['snaps'])} snap payloads; "
+          f"tanh fit {fg['final_J']:.3e}; STE atom delta {d_ste:.2e})")
 
 
 if __name__ == "__main__":

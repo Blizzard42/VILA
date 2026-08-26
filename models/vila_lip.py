@@ -76,6 +76,7 @@ class Learner(UpperboundLearner):
             ss = [x for x in ss.split(",") if x]
         self.lip_snap_steps = [int(x) for x in ss]
         self.memory_save = args.get("memory_save", False)
+        self.lip_fit_ste = args.get("lip_fit_ste", False)
         self.head_from_memory = args.get("head_from_memory", "")
         self.head_from_snap = int(args.get("head_from_snap", 0))  # 0 = final
         self.head_budget_mult = int(args.get("head_budget_mult", 1))
@@ -328,7 +329,9 @@ class Learner(UpperboundLearner):
         self._fit_memory(parts, B0, Y0, "w_old={:.4f}".format(w_old))
 
     def _fit_memory(self, parts, B0, Y0, note):
-        TAR = make_target(parts, self.head.Bg)
+        gate = (getattr(self.head, "gate_act", "step"),
+                float(getattr(self.head, "gate_scale", 1.0)))
+        TAR = make_target(parts, self.head.Bg, gate=gate)
         logging.info("task {} lip fit: target {} rows ({}), m={}, {} steps"
                      .format(self._cur_task, TAR["Z"].shape[0], note,
                              self.memory_m, self.lip_fit_steps))
@@ -341,6 +344,7 @@ class Learner(UpperboundLearner):
                       sched=self.lip_fit_sched,
                       snap_steps=self.lip_snap_steps,
                       wm_chunk=2048 if TAR["Z"].shape[0] > 20000 else 8192,
+                      ste=self.lip_fit_ste,
                       verbose=lambda s: logging.info(s.strip()))
         if fit["status"] != "ok":
             raise RuntimeError("lip fit diverged at task {} step {}".format(

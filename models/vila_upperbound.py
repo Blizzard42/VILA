@@ -52,6 +52,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from models.vila import Learner as VilaLearner, num_workers
+from models.lip_fit import GATE_ACTS
 
 
 # --------------------------------------------------------------------------
@@ -138,8 +139,12 @@ class ReLUHead(nn.Module):
 
 class AGaLUHead(nn.Module):
     """e_47 acil_upperbound BasicAGaLU port: 1 gated hidden layer,
-    h = 1[Bg x > 0] (o) (W1 x) with Bg frozen ~ N(0, 1/d) and W1 trainable
-    ~ N(0, 1/d), width = args["Hidden"]; optional dropout (head_dropout)."""
+    h = act(Bg x) (o) (W1 x) with Bg FROZEN ~ N(0, 1/d) (a random projection,
+    never trained -- the net stays linear in its trainable weights for fixed
+    gates) and W1 trainable ~ N(0, 1/d), width = args["Hidden"]; optional
+    dropout (head_dropout).  Wave 10: gate_act picks the activation (default
+    "step" = the classic 1[.>0], bit-identical); gate_scale is a run-level
+    constant divisor (see set_gate_scale), 1.0 unless gate_norm is on."""
 
     def __init__(self, in_features, args, device):
         super().__init__()
@@ -151,6 +156,18 @@ class AGaLUHead(nn.Module):
         drop = args.get("head_dropout", 0.0)
         self.drop = nn.Dropout(drop) if drop > 0 else nn.Identity()
         self.head = nn.Linear(kh, 0, bias=False, device=device)
+        self.gate_act = args.get("gate_act", "step")
+        assert self.gate_act in GATE_ACTS, self.gate_act
+        self.register_buffer("gate_scale",
+                             torch.ones((), dtype=torch.float32, device=device))
+
+    @torch.no_grad()
+    def set_gate_scale(self, feats):
+        """gate_norm: divide gates by the rms of act(Bg z) over the given
+        rows (the task-0 cache) -- ONE run-level constant, shared with the
+        LIP fit so memory and head live in the same feature space."""
+        g = GATE_ACTS[self.gate_act](feats @ self.Bg.T)
+        self.gate_scale.copy_(g.pow(2).mean().sqrt())
 
     @torch.no_grad()
     def preprocess(self, network, images, clip_images):
@@ -166,7 +183,8 @@ class AGaLUHead(nn.Module):
         self.head = new
 
     def forward(self, features):
-        h = (features @ self.Bg.T > 0).to(features.dtype) * (features @ self.W1.T)
+        g = GATE_ACTS[self.gate_act](features @ self.Bg.T) / self.gate_scale
+        h = g * (features @ self.W1.T)
         return {"buffer_feature": h, "logits": self.head(self.drop(h))}
 
 
@@ -363,6 +381,13 @@ class Learner(VilaLearner):
                                 else torch.cat([self._test_feats, feats]))
             self._test_labels = (labels if self._test_labels is None
                                  else torch.cat([self._test_labels, labels]))
+        # wave 10: gate_norm sets the run-level gate scale ONCE, from the
+        # task-0 cache (this method runs for every learner that caches)
+        if (self._cur_task == 0 and self.args.get("gate_norm", False)
+                and hasattr(self.head, "set_gate_scale")):
+            self.head.set_gate_scale(self._seen_feats)
+            logging.info("gate_norm: gate_scale = {:.6f}".format(
+                float(self.head.gate_scale)))
 
     @torch.no_grad()
     def _eval_cached(self, text_features):
