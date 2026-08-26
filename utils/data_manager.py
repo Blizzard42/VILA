@@ -30,6 +30,20 @@ class DataManager(object):
         offset = len(self._class_order) - sum(self._increments)
         if offset > 0:
             self._increments.append(offset)
+        # e_48 wave 8: cap the run at the first `limit_classes` classes of the
+        # (shuffled) class order -- everything downstream keys off _increments,
+        # so truncating it yields a shorter, otherwise-identical run.
+        lim = int(args.get("limit_classes", 0) or 0) if isinstance(args, dict) else 0
+        if lim:
+            inc, tot = [], 0
+            for i in self._increments:
+                if tot + i > lim:
+                    break
+                inc.append(i)
+                tot += i
+            assert tot == lim, \
+                f"limit_classes={lim} must be a sum of leading increments"
+            self._increments = inc
         print('Training class stages:', self._increments)
             
     @property
