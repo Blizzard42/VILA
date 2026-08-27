@@ -149,8 +149,17 @@ class AGaLUHead(nn.Module):
     def __init__(self, in_features, args, device):
         super().__init__()
         kh = args["Hidden"]
-        self.register_buffer(
-            "Bg", torch.randn(kh, in_features, device=device) / in_features ** 0.5)
+        gs = args.get("gate_seed", None)
+        if gs in (None, ""):
+            Bg0 = torch.randn(kh, in_features, device=device)
+        else:
+            # wave 17: reseed ONLY the frozen gate projection (the kernel).
+            # CPU generator; also burn the device randn so every other
+            # random event matches the unseeded run.
+            torch.randn(kh, in_features, device=device)
+            g = torch.Generator().manual_seed(int(gs))
+            Bg0 = torch.randn(kh, in_features, generator=g).to(device)
+        self.register_buffer("Bg", Bg0 / in_features ** 0.5)
         self.W1 = nn.Parameter(
             torch.randn(kh, in_features, device=device) / in_features ** 0.5)
         drop = args.get("head_dropout", 0.0)
