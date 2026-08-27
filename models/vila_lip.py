@@ -82,6 +82,9 @@ class Learner(UpperboundLearner):
         # one).  None = same alpha as the head (the default, all prior waves).
         la = args.get("lip_fit_alpha", None)
         self.lip_fit_alpha = None if la in (None, "") else float(la)
+        # wave 15: warm-start draw rule for the first fit (uniform | balanced)
+        self.lip_init_draw = args.get("lip_init_draw", "uniform")
+        assert self.lip_init_draw in ("uniform", "balanced")
         self.head_from_memory = args.get("head_from_memory", "")
         self.head_from_snap = int(args.get("head_from_snap", 0))  # 0 = final
         self.head_budget_mult = int(args.get("head_budget_mult", 1))
@@ -324,7 +327,22 @@ class Learner(UpperboundLearner):
                 B0 = torch.cat([B0, new_X[d]])       # the first-fit init rule)
                 Y0 = torch.cat([Y0, Y_new[d].float()])
         else:                                        # first fit: uniform draw
-            draw = torch.randperm(new_X.shape[0], device=self._device)[:m]
+            if self.lip_init_draw == "balanced":
+                # wave 15: class-stratified warm-start draw -- shuffle within
+                # each class, then take rows round-robin across classes until
+                # m (uniform-draw class counts at m=500/C=100 range ~1-10)
+                perm = torch.randperm(new_y.shape[0], device=self._device)
+                yp = new_y[perm]
+                cols = [perm[yp == c] for c in torch.unique(new_y).tolist()]
+                order, r = [], 0
+                while (sum(len(o) for o in order) < m
+                       and r < max(len(c) for c in cols)):
+                    order += [c[r:r + 1] for c in cols if len(c) > r]
+                    r += 1
+                draw = torch.cat(order)[:m]
+            else:
+                draw = torch.randperm(new_X.shape[0],
+                                      device=self._device)[:m]
             B0, Y0 = new_X[draw], Y_new[draw].float()
         if self.lip_fit_init == "rand":              # from-scratch every fit:
             allZ = torch.cat([p[0] for p in parts]).float()   # moment-matched
