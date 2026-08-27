@@ -66,6 +66,7 @@ GATE_ACTS = {
     "gauss": lambda t: torch.exp(-t * t),
     "exp": torch.exp,
     "expm1": torch.expm1,
+    "softplus": torch.nn.functional.softplus,
 }
 
 

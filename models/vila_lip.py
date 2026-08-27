@@ -43,7 +43,7 @@ from torch.utils.data import DataLoader
 
 from models.vila import num_workers
 from models.vila_upperbound import HEADS, Learner as UpperboundLearner
-from models.lip_fit import make_target, fit_lip, LIP_CURVE
+from models.lip_fit import make_target, fit_lip, LIP_CURVE, GATE_ACTS
 
 
 class Learner(UpperboundLearner):
@@ -77,6 +77,11 @@ class Learner(UpperboundLearner):
         self.lip_snap_steps = [int(x) for x in ss]
         self.memory_save = args.get("memory_save", False)
         self.lip_fit_ste = args.get("lip_fit_ste", False)
+        # wave 14: fit-side gate alpha override (fit<->head kernel MISMATCH:
+        # fit the memory under a smooth kernel, deploy the head at a sharper
+        # one).  None = same alpha as the head (the default, all prior waves).
+        la = args.get("lip_fit_alpha", None)
+        self.lip_fit_alpha = None if la in (None, "") else float(la)
         self.head_from_memory = args.get("head_from_memory", "")
         self.head_from_snap = int(args.get("head_from_snap", 0))  # 0 = final
         self.head_budget_mult = int(args.get("head_budget_mult", 1))
@@ -332,6 +337,16 @@ class Learner(UpperboundLearner):
         gate = (getattr(self.head, "gate_act", "step"),
                 float(getattr(self.head, "gate_scale", 1.0)),
                 float(getattr(self.head, "gate_alpha", 1.0)))
+        if self.lip_fit_alpha is not None:
+            g_act, g_scale = gate[0], gate[1]
+            if self.args.get("gate_norm", False):
+                # mirror set_gate_scale at the FIT alpha (run-level constant)
+                g = GATE_ACTS[g_act](self.lip_fit_alpha
+                                     * (self._seen_feats @ self.head.Bg.T))
+                g_scale = float(g.pow(2).mean().sqrt())
+            logging.info("lip_fit_alpha={} (head alpha {}), fit gate scale "
+                         "{:.6f}".format(self.lip_fit_alpha, gate[2], g_scale))
+            gate = (g_act, g_scale, self.lip_fit_alpha)
         TAR = make_target(parts, self.head.Bg, gate=gate)
         logging.info("task {} lip fit: target {} rows ({}), m={}, {} steps"
                      .format(self._cur_task, TAR["Z"].shape[0], note,
