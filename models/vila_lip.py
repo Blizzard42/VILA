@@ -85,6 +85,9 @@ class Learner(UpperboundLearner):
         # wave 15: warm-start draw rule for the first fit (uniform | balanced)
         self.lip_init_draw = args.get("lip_init_draw", "uniform")
         assert self.lip_init_draw in ("uniform", "balanced")
+        # wave 16: independent seed for the warm-start draw only
+        ds = args.get("lip_draw_seed", None)
+        self.lip_draw_seed = None if ds in (None, "") else int(ds)
         self.head_from_memory = args.get("head_from_memory", "")
         self.head_from_snap = int(args.get("head_from_snap", 0))  # 0 = final
         self.head_budget_mult = int(args.get("head_budget_mult", 1))
@@ -156,7 +159,14 @@ class Learner(UpperboundLearner):
                 if self.lip_centred_y:
                     pi = Y.mean(dim=0)         # class priors of the seen rows
                     Y = Y - pi
-                draw = torch.randperm(X.shape[0], device=self._device)[:m]
+                draw = self._draw_init(self._seen_labels, m)
+                logging.info("joint init draw ({}): {} rows, class counts "
+                             "min/max {}/{}".format(
+                                 self.lip_init_draw, draw.numel(),
+                                 int(torch.bincount(self._seen_labels[draw],
+                                                    minlength=C).min()),
+                                 int(torch.bincount(self._seen_labels[draw],
+                                                    minlength=C).max())))
                 fit = self._fit_memory([(X.double(), Y, 1.0)],
                                        X[draw], Y[draw].float(), "joint")
                 if self.memory_save:
@@ -327,22 +337,7 @@ class Learner(UpperboundLearner):
                 B0 = torch.cat([B0, new_X[d]])       # the first-fit init rule)
                 Y0 = torch.cat([Y0, Y_new[d].float()])
         else:                                        # first fit: uniform draw
-            if self.lip_init_draw == "balanced":
-                # wave 15: class-stratified warm-start draw -- shuffle within
-                # each class, then take rows round-robin across classes until
-                # m (uniform-draw class counts at m=500/C=100 range ~1-10)
-                perm = torch.randperm(new_y.shape[0], device=self._device)
-                yp = new_y[perm]
-                cols = [perm[yp == c] for c in torch.unique(new_y).tolist()]
-                order, r = [], 0
-                while (sum(len(o) for o in order) < m
-                       and r < max(len(c) for c in cols)):
-                    order += [c[r:r + 1] for c in cols if len(c) > r]
-                    r += 1
-                draw = torch.cat(order)[:m]
-            else:
-                draw = torch.randperm(new_X.shape[0],
-                                      device=self._device)[:m]
+            draw = self._draw_init(new_y, m)
             B0, Y0 = new_X[draw], Y_new[draw].float()
         if self.lip_fit_init == "rand":              # from-scratch every fit:
             allZ = torch.cat([p[0] for p in parts]).float()   # moment-matched
@@ -350,6 +345,33 @@ class Learner(UpperboundLearner):
                   * torch.randn(m, allZ.shape[1], device=self._device))
             Y0 = 0.01 * torch.randn(m, C, device=self._device)
         self._fit_memory(parts, B0, Y0, "w_old={:.4f}".format(w_old))
+
+    def _draw_init(self, y, m):
+        """Warm-start draw of m row indices.  uniform = randperm (all prior
+        waves); balanced (wave 15) = shuffle within each class, then take
+        rows round-robin across classes until m (uniform-draw class counts
+        at m=500/C=100 range 0-14, some classes absent)."""
+        if self.lip_draw_seed is not None:
+            # wave 16: reseed ONLY the draw (isolates draw quality from the
+            # rest of the seed's effects).  CPU generator for determinism.
+            g = torch.Generator().manual_seed(self.lip_draw_seed)
+            # burn the baseline's device randperm so every OTHER random
+            # event (mb sampling, head init order) matches the unseeded run
+            torch.randperm(y.shape[0], device=self._device)
+            full = torch.randperm(y.shape[0], generator=g).to(self._device)
+        else:
+            full = torch.randperm(y.shape[0], device=self._device)
+        if self.lip_init_draw != "balanced":
+            return full[:m]
+        perm = full
+        yp = y[perm]
+        cols = [perm[yp == c] for c in torch.unique(y).tolist()]
+        order, r = [], 0
+        while (sum(len(o) for o in order) < m
+               and r < max(len(c) for c in cols)):
+            order += [c[r:r + 1] for c in cols if len(c) > r]
+            r += 1
+        return torch.cat(order)[:m]
 
     def _fit_memory(self, parts, B0, Y0, note):
         gate = (getattr(self.head, "gate_act", "step"),
