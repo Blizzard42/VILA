@@ -87,6 +87,14 @@ class Learner(UpperboundLearner):
             "atom subsampling and chunking are separate arms"
         if self.lip_chunks > 1:
             assert self.memory_mode == "joint", "chunking is a joint-fit arm"
+        # wave 31.1: lip-specific phases on the shared PhaseTimer (chunked
+        # runs accumulate one lip_fit count per chunk; union_eval is timed
+        # inline in _fit_memory_chunked)
+        for name, meth in (("lip_fit", "_fit_memory"),
+                           ("snap_head", "_train_snap_head"),
+                           ("cache_test_feats", "_cache_test_features"),
+                           ("fresh_retrain", "_fresh_retrain")):
+            self._pt.wrap(self, name, meth)
         # wave 14: fit-side gate alpha override (fit<->head kernel MISMATCH:
         # fit the memory under a smooth kernel, deploy the head at a sharper
         # one).  None = same alpha as the head (the default, all prior waves).
@@ -158,6 +166,7 @@ class Learner(UpperboundLearner):
                 self._cache_test_features()   # eval set only, no train cache
                 if last:
                     self._head_from_memory()
+                logging.info(self._pt.summary())
                 return
             self._cache_task_features()
             self._seen_count = self._seen_feats.shape[0]
@@ -201,6 +210,7 @@ class Learner(UpperboundLearner):
                                           s["Y"].to(self._device), 71 + i)
                 self._seen_feats, self._seen_labels = self._mem_X, self._mem_Y
                 self._train_head()
+            logging.info(self._pt.summary())
             return
 
         # capture ONLY the new task's rows (the cache; parent concatenates)
@@ -220,6 +230,7 @@ class Learner(UpperboundLearner):
             if last and self.final_fresh_retrain:
                 self._fresh_retrain()
         self._seen_feats = self._seen_labels = None  # the cache is gone
+        logging.info(self._pt.summary())
 
     def _cache_test_features(self):
         """The TEST half of the parent's _cache_task_features, alone:
@@ -465,21 +476,24 @@ class Learner(UpperboundLearner):
         B = torch.cat([f["B"] for f in fits])
         Yat = torch.cat([f["Yat"] for f in fits])
         # the union's exact J vs the FULL target (the comparable number)
-        TARf = make_target([(X.double(), Y, 1.0)], self.head.Bg, gate=gate)
-        momf = wmoments(TARf, chunk=2048)
-        lam, nan = self.lip_lambda_mv, float("nan")
-        snaps = []
-        for j, s in enumerate(self.lip_snap_steps):
-            Bs = torch.cat([f["snaps"][j]["B"] for f in fits])
-            Ys = torch.cat([f["snaps"][j]["Y"] for f in fits])
-            st = exact_state(Bs, Ys, TARf, momf, lam, self.head.Bg)
-            snaps.append(dict(step=int(s), J=st["J"], B=Bs, Y=Ys))
-            print(88, s, st["J"], st["J_M"], st["J_V"], st["x_norm_mean"],
-                  st["y_norm_mean"], nan, file=self._lip_log, sep=",")
-        fin = exact_state(B, Yat, TARf, momf, lam, self.head.Bg)
-        print(88, self.lip_fit_steps, fin["J"], fin["J_M"], fin["J_V"],
-              fin["x_norm_mean"], fin["y_norm_mean"], nan,
-              file=self._lip_log, sep=",")
+        with self._pt("union_eval"):
+            TARf = make_target([(X.double(), Y, 1.0)], self.head.Bg,
+                               gate=gate)
+            momf = wmoments(TARf, chunk=2048)
+            lam, nan = self.lip_lambda_mv, float("nan")
+            snaps = []
+            for j, s in enumerate(self.lip_snap_steps):
+                Bs = torch.cat([f["snaps"][j]["B"] for f in fits])
+                Ys = torch.cat([f["snaps"][j]["Y"] for f in fits])
+                st = exact_state(Bs, Ys, TARf, momf, lam, self.head.Bg)
+                snaps.append(dict(step=int(s), J=st["J"], B=Bs, Y=Ys))
+                print(88, s, st["J"], st["J_M"], st["J_V"],
+                      st["x_norm_mean"], st["y_norm_mean"], nan,
+                      file=self._lip_log, sep=",")
+            fin = exact_state(B, Yat, TARf, momf, lam, self.head.Bg)
+            print(88, self.lip_fit_steps, fin["J"], fin["J_M"], fin["J_V"],
+                  fin["x_norm_mean"], fin["y_norm_mean"], nan,
+                  file=self._lip_log, sep=",")
         logging.info("chunked union (k={}): m={} exact J={:.6e} J_M={:.3e} "
                      "J_V={:.3e}".format(k, B.shape[0], fin["J"],
                                          fin["J_M"], fin["J_V"]))

@@ -44,6 +44,8 @@ same U(-1/sqrt(d), 1/sqrt(d)) law as nn.Linear's default init; unset =
 bit-identical to previous waves).
 """
 import logging
+import time
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -53,6 +55,44 @@ from torch.utils.data import DataLoader
 
 from models.vila import Learner as VilaLearner, num_workers
 from models.lip_fit import GATE_ACTS
+
+
+class PhaseTimer:
+    """Coarse wall-clock phase accumulator, reported as one '[time]' log
+    line per task.  Phases NEST (head_eval runs inside head_train;
+    snap_head calls head_train; chunked lip fits accumulate one lip_fit
+    count per chunk): the summary prints RAW per-phase totals, so nested
+    phases overlap and their sum can exceed the wall clock.  GPU work is
+    not synchronized -- phase boundaries sit at the pipeline's natural
+    .item()/logging sync points -- so these are coarse benchmarks, not
+    profiles.  Untimed remainder = trainer-side eval + data loading."""
+
+    def __init__(self):
+        self.acc, self.n, self.t0 = {}, {}, time.time()
+
+    @contextmanager
+    def __call__(self, name):
+        t = time.time()
+        try:
+            yield
+        finally:
+            self.acc[name] = self.acc.get(name, 0.0) + time.time() - t
+            self.n[name] = self.n.get(name, 0) + 1
+
+    def wrap(self, obj, name, meth):
+        """Rebind obj.meth (MRO-resolved, so overrides are caught) to a
+        version timed under `name`."""
+        fn = getattr(obj, meth)
+
+        def timed(*a, **k):
+            with self(name):
+                return fn(*a, **k)
+        setattr(obj, meth, timed)
+
+    def summary(self):
+        return "[time] wall {:.1f}s; ".format(time.time() - self.t0) + " ".join(
+            "{}={:.1f}s/{}".format(k, v, self.n[k])
+            for k, v in sorted(self.acc.items(), key=lambda kv: -kv[1]))
 
 
 # --------------------------------------------------------------------------
@@ -324,6 +364,14 @@ class Learner(VilaLearner):
         self._head_log = open(stem + "_head_curves.csv", "w", buffering=1)
         print("task", "epoch", "lr", "train_loss", "train_acc", "test_acc",
               file=self._head_log, sep=",")
+        # wave 31.1: coarse phase timing ('[time]' log lines, greppable)
+        self._pt = PhaseTimer()
+        for name, meth in (("init_backbone", "_init_train"),
+                           ("cache_feats", "_cache_task_features"),
+                           ("head_train", "_train_head"),
+                           ("head_analytic", "_solve_head_analytic"),
+                           ("head_eval", "_eval_cached")):
+            self._pt.wrap(self, name, meth)
 
     def incremental_train(self, data_manager):
         self._cur_task += 1
@@ -358,6 +406,7 @@ class Learner(VilaLearner):
             if self._cur_task == 0 and self.head_task0_scale != 1.0:
                 with torch.no_grad():
                     self.head.head.weight.mul_(self.head_task0_scale)
+        logging.info(self._pt.summary())
 
     @torch.no_grad()
     def _cache_task_features(self):
