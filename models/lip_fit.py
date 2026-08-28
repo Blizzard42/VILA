@@ -156,6 +156,29 @@ def _J_terms(B, Yat, G_B, Z, Y, w, G, S_M, S_V, lam):
     return lam * J_M + (1.0 - lam) * J_V, J_M, J_V
 
 
+def _J_terms_split(B, Yat, G_B, iL, iR, Z, Y, w, G, S_M, S_V, lam):
+    """Atom-subsampled J with the quadratic term estimated on L x R index
+    sets (iL=None -> the full left side, mode 'half'; two INDEPENDENT draws
+    -> mode 'ind') while the target cross term stays FULL-atom.  Unbiased
+    for J and its gradient: with one side full (or the sides independent)
+    the estimator is linear in each sampled uniform measure, so E commutes
+    -- unlike the naive subset-everywhere mode, which is quadratic in one
+    sampled measure (diagonal/variance inflation -> the collapse pressure).
+    Cost: the m x m atom Gram becomes mL x mR."""
+    m, kk = B.shape[0], G_B.shape[1]
+    BL, GL, YL = (B, G_B, Yat) if iL is None else (B[iL], G_B[iL], Yat[iL])
+    BR, GR, YR = B[iR], G_B[iR], Yat[iR]
+    mL, mR = BL.shape[0], BR.shape[0]
+    KLR = (BL @ BR.T) * (_gram(GL, GR, B.dtype) / float(kk))
+    PL = (B @ Z.T) * (_gram(G_B, G, B.dtype) / float(kk))
+    J_M = ((KLR * KLR).sum() / (mL * mR)
+           - 2.0 * ((PL * PL) @ w).sum() / m + S_M)
+    h = PL @ (w[:, None] * Y)
+    J_V = (torch.einsum("ac,ab,bc->", YL, KLR, YR) / (mL * mR)
+           - 2.0 * (Yat * h).sum() / m + S_V)
+    return lam * J_M + (1.0 - lam) * J_V
+
+
 def exact_state(B, Yat, TAR, mom, lam, Bg):
     """THE exact fp64 (M, V) evaluator: every reported J goes through
     literally this expression.  Gates derived from the atoms (tied), with
@@ -184,7 +207,7 @@ def _rms(t):
 def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
             dtype=torch.float32, mb=0, jitter=0.0, snapshot_best=False,
             sched="const", snap_steps=(), wm_chunk=8192, ste=False,
-            verbose=print):
+            atom_mb=0, atom_mode="naive", verbose=print):
     """One LIP fit: Adam on free natural-scale (atoms, targets), init (B0, Y0)
     -- the warm start IS the init (no redraw, no Y* solve) -- minimizing the
     exact full-batch J against the weighted target.  RELATIVE lr: each param
@@ -212,6 +235,16 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
     ste           straight-through estimator (step gates only): forward J is
                   unchanged, but the atoms' gate factor backpropagates through
                   a sigmoid surrogate instead of the frozen a.e. mask.
+    atom_mb > 0   wave-31 ATOM-side subsampling: each step draws atom_mb of
+                  the m atoms uniformly WITHOUT replacement.  atom_mode:
+                  'naive'  the subset IS the atom set that step (quadratic
+                           both sides + cross, uniform 1/atom_mb) -- the
+                           literal target trick, BIASED (quadratic in the
+                           sampled measure; the modal-collapse control);
+                  'half'   quadratic = full x subset, cross = full-atom --
+                           UNBIASED for J and its gradient, cost linear in m;
+                  'ind'    quadratic = two INDEPENDENT subsets (atom_mb x
+                           atom_mb), cross = full-atom -- also unbiased.
 
     Gates follow TAR["gate"] = (act, scale); smooth acts are differentiable
     in the atoms, so their gradient flows through the gate term naturally.
@@ -232,6 +265,9 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
         opt, lambda t: 0.5 * (1.0 + math.cos(math.pi * min(t, steps)
                                              / float(steps))))
         if sched == "cosine" else None)
+    assert atom_mode in ("naive", "half", "ind"), atom_mode
+    assert 0 <= atom_mb <= m, (atom_mb, m)
+    assert not (atom_mb and ste), "atom subsampling + STE not supported"
     snap_set = {int(s) for s in snap_steps}
     assert all(0 < s < steps for s in snap_set), \
         f"snap_steps must lie inside the fit: {sorted(snap_set)} vs {steps}"
@@ -277,15 +313,29 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
         if jitter > 0:
             Z_t = Z_t + jitter * Z_std * torch.randn_like(Z_t)
             G_t = gates(Z_t, Bg_f, g_act, g_scale, g_alpha)  # tied jitter
-        if ste:
-            z_pre = Bp @ Bg_f.T
-            s = torch.sigmoid(z_pre)              # forward = step, backward =
-            G_B = ((z_pre > 0).to(dtype) - s).detach() + s   # d(sigmoid)
+        if atom_mb and atom_mode == "naive":
+            ia = torch.randperm(m, device=Bp.device)[:atom_mb]
+            B_s, Y_s = Bp[ia], Yp[ia]         # the subset IS the atom set
+            G_s = gates(B_s, Bg_f, g_act, g_scale, g_alpha)
+            loss, _, _ = _J_terms(B_s, Y_s, G_s, Z_t, Y_t, w_t, G_t,
+                                  mom["S_M"], mom["S_V"], lam)
+        elif atom_mb:
+            iR = torch.randperm(m, device=Bp.device)[:atom_mb]
+            iL = (None if atom_mode == "half"           # full left side
+                  else torch.randperm(m, device=Bp.device)[:atom_mb])
+            G_B = gates(Bp, Bg_f, g_act, g_scale, g_alpha)
+            loss = _J_terms_split(Bp, Yp, G_B, iL, iR, Z_t, Y_t, w_t, G_t,
+                                  mom["S_M"], mom["S_V"], lam)
         else:
-            G_B = gates(Bp, Bg_f, g_act, g_scale, g_alpha)  # step: a.e.
-        #                                        gradient; smooth: grad flows
-        loss, _, _ = _J_terms(Bp, Yp, G_B, Z_t, Y_t, w_t, G_t,
-                              mom["S_M"], mom["S_V"], lam)
+            if ste:
+                z_pre = Bp @ Bg_f.T
+                s = torch.sigmoid(z_pre)          # forward = step, backward =
+                G_B = ((z_pre > 0).to(dtype) - s).detach() + s   # d(sigmoid)
+            else:
+                G_B = gates(Bp, Bg_f, g_act, g_scale, g_alpha)  # step: a.e.
+            #                                    gradient; smooth: grad flows
+            loss, _, _ = _J_terms(Bp, Yp, G_B, Z_t, Y_t, w_t, G_t,
+                                  mom["S_M"], mom["S_V"], lam)
         lv = float(loss.detach().item())
         if not (lv == lv) or abs(lv) > DIVERGE_ABS:   # nan-safe
             status, diverged_at = "diverged", int(t)
@@ -473,6 +523,35 @@ def selftest():
        tol=1e-12)
     d_ste = float((f_ste["B"] - f_frz["B"]).abs().max().item())
     assert d_ste > 1e-8, "STE gradient did not diverge from the frozen mask"
+
+    # 13. atom subsampling (wave 31).  naive at p=m is the full J exactly
+    #     (a permutation of the atom set); 'half' and 'ind' are unbiased
+    #     Monte-Carlo estimators of J for FIXED atoms (and hence of its
+    #     gradient: the estimator is linear in the selection); a short fit
+    #     under each mode still improves the exact J.
+    G_full = masks(B, Bg)
+    perm = torch.randperm(m)
+    Jp, _, _ = _J_terms(B[perm], Yat[perm], G_full[perm], TAR["Z"], TAR["Y"],
+                        TAR["w"], TAR["G"], mom["S_M"], mom["S_V"], lam)
+    ok(float(Jp.item()), float(Jx.item()), "naive p=m == full J", tol=1e-12)
+    for mode, use_iL in (("half", False), ("ind", True)):
+        draws = []
+        for _ in range(4000):
+            iR = torch.randperm(m)[:4]
+            iL = torch.randperm(m)[:4] if use_iL else None
+            draws.append(float(_J_terms_split(
+                B, Yat, G_full, iL, iR, TAR["Z"], TAR["Y"], TAR["w"],
+                TAR["G"], mom["S_M"], mom["S_V"], lam).item()))
+        dr = torch.tensor(draws)
+        se_a = float(dr.std().item()) / len(draws) ** 0.5
+        assert abs(float(dr.mean().item()) - float(Jx.item())) < 4 * se_a, \
+            f"{mode} estimator biased: {dr.mean().item()} vs {Jx.item()}"
+    for mode in ("naive", "half", "ind"):
+        fa = fit_lip(TAR, B, Yat, Bg, steps=300, fit_lr=1e-2, lam=0.5,
+                     eval_every=100, adam_eps=1e-8, dtype=torch.float64,
+                     atom_mb=4, atom_mode=mode, verbose=lambda *a: None)
+        assert fa["status"] == "ok" and fa["final_J"] < 0.7 * st["J"], \
+            f"atom_mb {mode} fit did not improve: {fa['final_J']} vs {st['J']}"
 
     print(f"[lip_fit selftest] ALL OK (fit J {st['J']:.3e} -> "
           f"{f['final_J']:.3e}; mb unbiased within {se:.1e}; jitter fit "

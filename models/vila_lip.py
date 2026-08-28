@@ -77,6 +77,16 @@ class Learner(UpperboundLearner):
         self.lip_snap_steps = [int(x) for x in ss]
         self.memory_save = args.get("memory_save", False)
         self.lip_fit_ste = args.get("lip_fit_ste", False)
+        # wave 31: atom-side subsampling (see fit_lip atom_mb docstring) and
+        # fixed chunking (k independent subproblems, union memory); defaults
+        # reproduce all prior waves exactly
+        self.lip_fit_atom_mb = int(args.get("lip_fit_atom_mb", 0) or 0)
+        self.lip_fit_atom_mode = args.get("lip_fit_atom_mode", "naive")
+        self.lip_chunks = int(args.get("lip_chunks", 0) or 0)
+        assert not (self.lip_fit_atom_mb and self.lip_chunks > 1), \
+            "atom subsampling and chunking are separate arms"
+        if self.lip_chunks > 1:
+            assert self.memory_mode == "joint", "chunking is a joint-fit arm"
         # wave 14: fit-side gate alpha override (fit<->head kernel MISMATCH:
         # fit the memory under a smooth kernel, deploy the head at a sharper
         # one).  None = same alpha as the head (the default, all prior waves).
@@ -159,16 +169,19 @@ class Learner(UpperboundLearner):
                 if self.lip_centred_y:
                     pi = Y.mean(dim=0)         # class priors of the seen rows
                     Y = Y - pi
-                draw = self._draw_init(self._seen_labels, m)
-                logging.info("joint init draw ({}): {} rows, class counts "
-                             "min/max {}/{}".format(
-                                 self.lip_init_draw, draw.numel(),
-                                 int(torch.bincount(self._seen_labels[draw],
-                                                    minlength=C).min()),
-                                 int(torch.bincount(self._seen_labels[draw],
-                                                    minlength=C).max())))
-                fit = self._fit_memory([(X.double(), Y, 1.0)],
-                                       X[draw], Y[draw].float(), "joint")
+                if self.lip_chunks > 1:
+                    fit = self._fit_memory_chunked(X, Y)
+                else:
+                    draw = self._draw_init(self._seen_labels, m)
+                    logging.info("joint init draw ({}): {} rows, class counts "
+                                 "min/max {}/{}".format(
+                                     self.lip_init_draw, draw.numel(),
+                                     int(torch.bincount(self._seen_labels[draw],
+                                                        minlength=C).min()),
+                                     int(torch.bincount(self._seen_labels[draw],
+                                                        minlength=C).max())))
+                    fit = self._fit_memory([(X.double(), Y, 1.0)],
+                                           X[draw], Y[draw].float(), "joint")
                 if self.memory_save:
                     allsn = fit["snaps"] + [dict(step=self.lip_fit_steps,
                                                  J=fit["final_J"], B=fit["B"],
@@ -373,7 +386,7 @@ class Learner(UpperboundLearner):
             r += 1
         return torch.cat(order)[:m]
 
-    def _fit_memory(self, parts, B0, Y0, note):
+    def _fit_gate(self):
         gate = (getattr(self.head, "gate_act", "step"),
                 float(getattr(self.head, "gate_scale", 1.0)),
                 float(getattr(self.head, "gate_alpha", 1.0)))
@@ -387,10 +400,14 @@ class Learner(UpperboundLearner):
             logging.info("lip_fit_alpha={} (head alpha {}), fit gate scale "
                          "{:.6f}".format(self.lip_fit_alpha, gate[2], g_scale))
             gate = (g_act, g_scale, self.lip_fit_alpha)
+        return gate
+
+    def _fit_memory(self, parts, B0, Y0, note, task_tag=None, m_i=None):
+        gate = self._fit_gate()
         TAR = make_target(parts, self.head.Bg, gate=gate)
         logging.info("task {} lip fit: target {} rows ({}), m={}, {} steps"
                      .format(self._cur_task, TAR["Z"].shape[0], note,
-                             self.memory_m, self.lip_fit_steps))
+                             m_i or self.memory_m, self.lip_fit_steps))
         fit = fit_lip(TAR, B0, Y0, self.head.Bg, steps=self.lip_fit_steps,
                       fit_lr=self.lip_fit_lr, lam=self.lip_lambda_mv,
                       eval_every=self.lip_fit_eval_every,
@@ -401,15 +418,74 @@ class Learner(UpperboundLearner):
                       snap_steps=self.lip_snap_steps,
                       wm_chunk=2048 if TAR["Z"].shape[0] > 20000 else 8192,
                       ste=self.lip_fit_ste,
+                      atom_mb=self.lip_fit_atom_mb,
+                      atom_mode=self.lip_fit_atom_mode,
                       verbose=lambda s: logging.info(s.strip()))
         if fit["status"] != "ok":
             raise RuntimeError("lip fit diverged at task {} step {}".format(
                 self._cur_task, fit["diverged_at"]))
         self._mem_X, self._mem_Y = fit["B"], fit["Yat"]
+        tag = self._cur_task if task_tag is None else task_tag
         for i in range(len(fit["curve"]["step"])):
-            print(self._cur_task, *[fit["curve"][k][i] for k in LIP_CURVE],
+            print(tag, *[fit["curve"][k][i] for k in LIP_CURVE],
                   file=self._lip_log, sep=",")
         return fit
+
+    def _fit_memory_chunked(self, X, Y):
+        """Wave 31 arm (b): split the joint target into k class-STRATIFIED
+        chunks (shuffle within class, deal rows round-robin), fit m_i ~ m/k
+        atoms per chunk INDEPENDENTLY (each chunk is its own normalized
+        subproblem: full frontier recipe, mb estimator within the chunk,
+        warm start drawn from the chunk's own rows), memory = the union at
+        uniform 1/m.  Exact within chunk, biased at the problem level (each
+        chunk matches a different target).  lip_curves.csv: task 80+i =
+        chunk i's exact-J curve vs ITS OWN chunk target; task 88 = the
+        union's exact fp64 J vs the FULL 50k target (snap steps + final,
+        g_flip_frac = nan there: no single init mask set)."""
+        from models.lip_fit import exact_state, wmoments
+        k, m, y = self.lip_chunks, self.memory_m, self._seen_labels
+        gate = self._fit_gate()
+        chunks = [[] for _ in range(k)]
+        for c in torch.unique(y).tolist():
+            rows = torch.nonzero(y == c, as_tuple=True)[0]
+            rows = rows[torch.randperm(rows.numel(), device=rows.device)]
+            for i in range(k):
+                chunks[i].append(rows[i::k])
+        chunks = [torch.cat(ch) for ch in chunks]
+        ms = [m // k + (1 if i < m % k else 0) for i in range(k)]
+        fits = []
+        for i, (rows, mi) in enumerate(zip(chunks, ms)):
+            draw = rows[torch.randperm(rows.numel(),
+                                       device=rows.device)[:mi]]
+            fits.append(self._fit_memory(
+                [(X[rows].double(), Y[rows], 1.0)],
+                X[draw], Y[draw].float(),
+                "chunk {}/{} m_i={}".format(i, k, mi),
+                task_tag=80 + i, m_i=mi))
+        B = torch.cat([f["B"] for f in fits])
+        Yat = torch.cat([f["Yat"] for f in fits])
+        # the union's exact J vs the FULL target (the comparable number)
+        TARf = make_target([(X.double(), Y, 1.0)], self.head.Bg, gate=gate)
+        momf = wmoments(TARf, chunk=2048)
+        lam, nan = self.lip_lambda_mv, float("nan")
+        snaps = []
+        for j, s in enumerate(self.lip_snap_steps):
+            Bs = torch.cat([f["snaps"][j]["B"] for f in fits])
+            Ys = torch.cat([f["snaps"][j]["Y"] for f in fits])
+            st = exact_state(Bs, Ys, TARf, momf, lam, self.head.Bg)
+            snaps.append(dict(step=int(s), J=st["J"], B=Bs, Y=Ys))
+            print(88, s, st["J"], st["J_M"], st["J_V"], st["x_norm_mean"],
+                  st["y_norm_mean"], nan, file=self._lip_log, sep=",")
+        fin = exact_state(B, Yat, TARf, momf, lam, self.head.Bg)
+        print(88, self.lip_fit_steps, fin["J"], fin["J_M"], fin["J_V"],
+              fin["x_norm_mean"], fin["y_norm_mean"], nan,
+              file=self._lip_log, sep=",")
+        logging.info("chunked union (k={}): m={} exact J={:.6e} J_M={:.3e} "
+                     "J_V={:.3e}".format(k, B.shape[0], fin["J"],
+                                         fin["J_M"], fin["J_V"]))
+        self._mem_X, self._mem_Y = B, Yat
+        return dict(status="ok", B=B, Yat=Yat, snaps=snaps,
+                    **{"final_" + kk: v for kk, v in fin.items()})
 
     # ---------------------------------------------------------------- train
     def _train_head(self):
