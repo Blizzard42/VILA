@@ -148,9 +148,17 @@ class Learner(UpperboundLearner):
         self.head_from_memory = args.get("head_from_memory", "")
         self.head_from_snap = int(args.get("head_from_snap", 0))  # 0 = final
         self.head_budget_mult = int(args.get("head_budget_mult", 1))
+        # wave 43: lip_fit_mb=-1 = INTENTIONAL full-batch joint fit (the
+        # exact gradient over all 50k target rows each step, the zero-
+        # estimator-noise endpoint); the assert still guards the json
+        # default mb=0 against an accidental full-batch.
+        self._full_batch = self.lip_fit_mb == -1
+        if self._full_batch:
+            self.lip_fit_mb = 0
         if self.memory_mode == "joint":
-            assert self.lip_fit_mb > 0, \
-                "joint mode fits a full-dataset target: mb estimator required"
+            assert self.lip_fit_mb > 0 or self._full_batch, \
+                "joint mode fits a full-dataset target: mb estimator " \
+                "required (or explicit lip_fit_mb=-1 for full batch)"
         self._seen_count = 0            # real rows seen so far (the weights)
         self._mem_X = self._mem_Y = None  # Y: fp32 [m, C] (lip) | int labels
         self._mem_G = None              # untied gates [m, k] (wave 36) | None
