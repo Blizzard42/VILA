@@ -90,6 +90,16 @@ class Learner(UpperboundLearner):
         # chunk fits only its own classes' rows.
         self.lip_chunk_mode = args.get("lip_chunk_mode", "stratified")
         assert self.lip_chunk_mode in ("stratified", "class")
+        # wave 44: classes-PER-CHUNK partitioning -- contiguous blocks of
+        # exactly c classes (last chunk takes the remainder, e.g. c=3 on
+        # C=100 -> 33 chunks of 3 + one of 1); each chunk gets
+        # (m/C) * |its classes| atoms (m must divide by C).  Overrides
+        # lip_chunks/lip_chunk_mode.
+        self.lip_chunk_classes = int(args.get("lip_chunk_classes", 0) or 0)
+        if self.lip_chunk_classes:
+            assert self.memory_mode == "joint" and not self.lip_fit_atom_mb
+            assert not self.lip_chunks, \
+                "lip_chunk_classes derives k itself; drop lip_chunks"
         assert not (self.lip_fit_atom_mb and self.lip_chunks > 1), \
             "atom subsampling and chunking are separate arms"
         if self.lip_chunks > 1:
@@ -231,7 +241,7 @@ class Learner(UpperboundLearner):
                     Y = Y - pi
                 if self.cache_draws > 1:
                     fit = self._fit_memory_lazy(X, Y)
-                elif self.lip_chunks > 1:
+                elif self.lip_chunks > 1 or self.lip_chunk_classes:
                     fit = self._fit_memory_chunked(X, Y)
                 elif self.lip_alpha_anneal:
                     fit = self._fit_memory_annealed(X, Y)
@@ -506,6 +516,7 @@ class Learner(UpperboundLearner):
                       atom_mb=self.lip_fit_atom_mb,
                       atom_mode=self.lip_fit_atom_mode,
                       untied_g=self.lip_untied_g,
+                      es_chunk=8192,
                       verbose=lambda s: logging.info(s.strip()))
         if fit["status"] != "ok":
             raise RuntimeError("lip fit diverged at task {} step {}".format(
@@ -534,7 +545,22 @@ class Learner(UpperboundLearner):
         from models.lip_fit import exact_state, wmoments
         k, m, y = self.lip_chunks, self.memory_m, self._seen_labels
         gate = self._fit_gate()
-        if self.lip_chunk_mode == "class":
+        ms = None
+        if self.lip_chunk_classes:
+            # wave 44: blocks of exactly c contiguous classes, last chunk =
+            # remainder; atoms proportional to each chunk's class count
+            c = self.lip_chunk_classes
+            cls = torch.unique(y).sort().values.tolist()
+            assert m % len(cls) == 0, (m, len(cls))
+            groups = [cls[i:i + c] for i in range(0, len(cls), c)]
+            k = len(groups)
+            chunks = [torch.nonzero(
+                torch.isin(y, torch.tensor(g, device=y.device)),
+                as_tuple=True)[0] for g in groups]
+            ms = [(m // len(cls)) * len(g) for g in groups]
+            logging.info("class-per-chunk chunking: c={} -> {} chunks, "
+                         "sizes {}..{}".format(c, k, ms[0], ms[-1]))
+        elif self.lip_chunk_mode == "class":
             cls = torch.unique(y).sort().values.tolist()
             per = [len(cls) // k + (1 if i < len(cls) % k else 0)
                    for i in range(k)]
@@ -555,7 +581,8 @@ class Learner(UpperboundLearner):
                 for i in range(k):
                     chunks[i].append(rows[i::k])
             chunks = [torch.cat(ch) for ch in chunks]
-        ms = [m // k + (1 if i < m % k else 0) for i in range(k)]
+        if ms is None:
+            ms = [m // k + (1 if i < m % k else 0) for i in range(k)]
         fits = []
         for i, (rows, mi) in enumerate(zip(chunks, ms)):
             draw = rows[torch.randperm(rows.numel(),
@@ -578,12 +605,12 @@ class Learner(UpperboundLearner):
             for j, s in enumerate(self.lip_snap_steps):
                 Bs = torch.cat([f["snaps"][j]["B"] for f in fits])
                 Ys = torch.cat([f["snaps"][j]["Y"] for f in fits])
-                st = exact_state(Bs, Ys, TARf, momf, lam, self.head.Bg)
+                st = exact_state(Bs, Ys, TARf, momf, lam, self.head.Bg, chunk=8192)
                 snaps.append(dict(step=int(s), J=st["J"], B=Bs, Y=Ys))
                 print(99, s, st["J"], st["J_M"], st["J_V"],
                       st["x_norm_mean"], st["y_norm_mean"], nan,
                       file=self._lip_log, sep=",")
-            fin = exact_state(B, Yat, TARf, momf, lam, self.head.Bg)
+            fin = exact_state(B, Yat, TARf, momf, lam, self.head.Bg, chunk=8192)
             print(99, self.lip_fit_steps, fin["J"], fin["J_M"], fin["J_V"],
                   fin["x_norm_mean"], fin["y_norm_mean"], nan,
                   file=self._lip_log, sep=",")

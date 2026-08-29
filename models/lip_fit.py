@@ -179,16 +179,34 @@ def _J_terms_split(B, Yat, G_B, iL, iR, Z, Y, w, G, S_M, S_V, lam):
     return lam * J_M + (1.0 - lam) * J_V
 
 
-def exact_state(B, Yat, TAR, mom, lam, Bg, G=None):
+def exact_state(B, Yat, TAR, mom, lam, Bg, G=None, chunk=0):
     """THE exact fp64 (M, V) evaluator: every reported J goes through
     literally this expression.  Gates derived from the atoms (tied), with
     the target's own gate activation; G (wave 36) = UNTIED per-atom gates,
-    used verbatim instead of deriving from the atoms."""
+    used verbatim instead of deriving from the atoms.  chunk > 0 (wave 44):
+    the m x n cross terms accumulate over target-row chunks -- pure fp64
+    re-ordering, bitwise-negligible, and the only way m=20000 vs a 50k
+    target fits in memory (the unchunked PL alone is 8 GB)."""
     Bd, Yd = B.detach().double(), Yat.detach().double()
     G_B = (G.detach().double() if G is not None
            else gates(Bd, Bg.double(), *TAR.get("gate", ("step", 1.0))))
-    J, J_M, J_V = _J_terms(Bd, Yd, G_B, TAR["Z"], TAR["Y"], TAR["w"],
-                           TAR["G"], mom["S_M"], mom["S_V"], lam)
+    if chunk and TAR["Z"].shape[0] > chunk:
+        Z, Y, w, Gt = TAR["Z"], TAR["Y"], TAR["w"], TAR["G"]
+        m, kk = Bd.shape[0], G_B.shape[1]
+        K1 = (Bd @ Bd.T) * (_gram(G_B, G_B, Bd.dtype) / float(kk))
+        t_M = torch.zeros((), dtype=torch.float64, device=Bd.device)
+        h = torch.zeros_like(Yd)
+        for i in range(0, Z.shape[0], chunk):
+            PL = ((Bd @ Z[i:i + chunk].T)
+                  * (_gram(G_B, Gt[i:i + chunk], Bd.dtype) / float(kk)))
+            t_M = t_M + ((PL * PL) @ w[i:i + chunk]).sum()
+            h = h + PL @ (w[i:i + chunk, None] * Y[i:i + chunk])
+        J_M = ((K1 * K1).sum() / m ** 2 - 2.0 * t_M / m + mom["S_M"])
+        J_V = (torch.einsum("ac,ab,bc->", Yd, K1, Yd) / m ** 2
+               - 2.0 * (Yd * h).sum() / m + mom["S_V"])
+    else:
+        _, J_M, J_V = _J_terms(Bd, Yd, G_B, TAR["Z"], TAR["Y"], TAR["w"],
+                               TAR["G"], mom["S_M"], mom["S_V"], lam)
     J_M = _nonneg(float(J_M.item()), (mom["S_M"], 1.0), "J_M")
     J_V = _nonneg(float(J_V.item()), (mom["S_V"], 1.0), "J_V")
     return dict(J=lam * J_M + (1.0 - lam) * J_V, J_M=J_M, J_V=J_V,
@@ -209,7 +227,7 @@ def _rms(t):
 def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
             dtype=torch.float32, mb=0, jitter=0.0, snapshot_best=False,
             sched="const", snap_steps=(), wm_chunk=8192, ste=False,
-            atom_mb=0, atom_mode="naive", untied_g=False, eval_TAR=None,
+            atom_mb=0, atom_mode="naive", untied_g=False, eval_TAR=None, es_chunk=0,
             verbose=print):
     """One LIP fit: Adam on free natural-scale (atoms, targets), init (B0, Y0)
     -- the warm start IS the init (no redraw, no Y* solve) -- minimizing the
@@ -326,7 +344,7 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
 
     def snapshot(step):
         with torch.no_grad():
-            sn = exact_state(Bp, Yp, ETAR, mom, lam, Bg, G=Gp)
+            sn = exact_state(Bp, Yp, ETAR, mom, lam, Bg, G=Gp, chunk=es_chunk)
             flip = (((Gp.detach() > 0.5) != G0u) if untied_g
                     else (masks(Bp.detach(), Bg_f) != G0))
             sn.update(step=int(step),
@@ -403,7 +421,7 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
     if snapshot_best and best["B"] is not None:
         B_out, Y_out, best_step = best["B"], best["Y"], best["step"]
         G_out = best.get("G")
-    fin = exact_state(B_out, Y_out, ETAR, mom, lam, Bg, G=G_out)
+    fin = exact_state(B_out, Y_out, ETAR, mom, lam, Bg, G=G_out, chunk=es_chunk)
     B_out, Y_out = B_out.float().clone(), Y_out.float().clone()
     G_out = None if G_out is None else G_out.float().clone()
     verbose(f"  [fit lip m={m}] {status} J={fin['J']:.6e} J_M={fin['J_M']:.3e} "
@@ -630,6 +648,16 @@ def selftest():
     #     J0 equals the tied fit's J0 exactly (the probe IS the target
     #     here), the mb fit improves the probe J, and the final reported J
     #     matches an independent exact_state of the returned atoms.
+    # 16. row-chunked exact_state (wave 44) == unchunked, to fp64
+    #     re-ordering tolerance, tied and untied
+    st_c = exact_state(B, Yat, TG, momg, 0.4, Bg, chunk=13)
+    ok(st_c["J_M"], stg["J_M"], "chunked J_M", tol=1e-12)
+    ok(st_c["J_V"], stg["J_V"], "chunked J_V", tol=1e-12)
+    G_rand = torch.rand(m, kk, dtype=torch.float64)
+    st_u1 = exact_state(B, Yat, TG, momg, 0.4, Bg, G=G_rand)
+    st_u2 = exact_state(B, Yat, TG, momg, 0.4, Bg, G=G_rand, chunk=7)
+    ok(st_u2["J"], st_u1["J"], "chunked untied J", tol=1e-12)
+
     # TG has non-uniform part weights; use a uniform-weight twin so the
     # lazy uniform-w TAR matches its probe exactly
     ZU = torch.cat([Z1, Z2])
