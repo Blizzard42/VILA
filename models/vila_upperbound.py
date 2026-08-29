@@ -42,6 +42,26 @@ task-0 fit, both solve modes — VILA's hard-coded 0.9); head_proj_seed
 (vila-mimic only: re-draw fc0 from its own CPU generator with this seed,
 same U(-1/sqrt(d), 1/sqrt(d)) law as nn.Linear's default init; unset =
 bit-identical to previous waves).
+
+Wave 40 keys (multi-draw augmentation statistics):
+  cache_draws (int, 1): cache k independent train-mode augmentation draws
+    per task instead of one (k passes of the train loader; the CLIP branch
+    is deterministic so its features repeat).  k > 1 caches are stored
+    fp16 (fp32 compute per batch) and the SGD head budget is STEP-MATCHED
+    to the 1-draw convention (head_epochs * ceil(n_real/bs) total steps,
+    n_real = rows/k) — draws add data richness, not compute.
+  cache_save (path): after the LAST task, write the whole per-task draw
+    cache ({task: {"F": [k, n_t, D] fp16 cpu, "y": [k, n_t] int64}}) so
+    one producer serves every arm.
+  cache_load (path): skip the backbone forward for TRAIN caching and take
+    the FIRST cache_draws draws per task from the file (test features are
+    still cached from this run's own backbone — same seed, same adapter).
+  head_solve additions: "none" (producer: no head fit at all);
+    "analytic_gram" (vila-mimic only: accumulate G += HtH, Q += HtY in
+    fp64 over every draw and task, solve W = (G + gamma I)^-1 Q per task —
+    the RLS-without-forgetting equivalent that stays feasible at k=100;
+    gamma = head_l2 if > 0 else the vila.py CV grid on the first 2500
+    task-0 rows, one first-draw-sized subsample).
 """
 import logging
 import time
@@ -359,7 +379,14 @@ class Learner(VilaLearner):
         self.head_batch_size = args.get("head_batch_size", 4096)
         self.head_eval_every = args.get("head_eval_every", 0)
         self.head_solve = args.get("head_solve", "sgd")
+        assert self.head_solve in ("sgd", "analytic", "analytic_gram", "none")
         self.head_task0_scale = args.get("head_task0_scale", 1.0)
+        # wave 40: multi-draw augmentation caches (module docstring)
+        self.cache_draws = int(args.get("cache_draws", 1) or 1)
+        self.cache_save = args.get("cache_save", "")
+        self.cache_load = args.get("cache_load", "")
+        self._cache_file = None          # lazy torch.load of cache_load
+        self._cache_dump = {}            # producer: per-task cpu tensors
         # CSVs land next to trainer.py's log file, same naming scheme
         init_cls = 0 if args["init_cls"] == args["increment"] else args["init_cls"]
         stem = "logs/{}/{}/{}/{}/{}_{}_{}".format(
@@ -374,6 +401,7 @@ class Learner(VilaLearner):
                            ("cache_feats", "_cache_task_features"),
                            ("head_train", "_train_head"),
                            ("head_analytic", "_solve_head_analytic"),
+                           ("head_analytic_gram", "_solve_head_analytic_gram"),
                            ("head_eval", "_eval_cached")):
             self._pt.wrap(self, name, meth)
 
@@ -403,28 +431,68 @@ class Learner(VilaLearner):
         self.head.append_task(self._total_classes - self._known_classes)
         n_prev = 0 if self._seen_feats is None else self._seen_feats.shape[0]
         self._cache_task_features()
-        if self.head_solve == "analytic":
+        if self.head_solve == "none":
+            pass                          # wave 40 producer: cache only
+        elif self.head_solve == "analytic":
             self._solve_head_analytic(n_prev)
+        elif self.head_solve == "analytic_gram":
+            self._solve_head_analytic_gram(n_prev)
         else:
             self._train_head()
             if self._cur_task == 0 and self.head_task0_scale != 1.0:
                 with torch.no_grad():
                     self.head.head.weight.mul_(self.head_task0_scale)
+        if (self.cache_save
+                and self._cur_task == data_manager.nb_tasks - 1):
+            torch.save(dict(draws=self.cache_draws, tasks=self._cache_dump),
+                       self.cache_save)
+            logging.info("draw cache ({} tasks x {} draws) -> {}".format(
+                len(self._cache_dump), self.cache_draws, self.cache_save))
         logging.info(self._pt.summary())
 
     @torch.no_grad()
     def _cache_task_features(self):
-        """One train-mode (augmented) draw per new-task sample -> seen cache;
+        """cache_draws train-mode (augmented) draws per new-task sample ->
+        seen cache (fp16 when draws > 1, or when loading a k>1-draw file);
         clean test features of the new classes -> test cache (for the cheap
-        per-epoch eval)."""
+        per-epoch eval), always from THIS run's backbone."""
         self._network.to(self._device)
         self._network.eval()
-        feats, labels = [], []
-        for _, data, clip_data, label in self.train_loader:
-            feats.append(self.head.preprocess(
-                self._network, data.to(self._device), clip_data.to(self._device)))
-            labels.append(label.to(self._device))
-        feats, labels = torch.cat(feats), torch.cat(labels)
+        k = self.cache_draws
+        if self.cache_load:
+            if self._cache_file is None:
+                self._cache_file = torch.load(self.cache_load,
+                                              map_location="cpu")
+                stored = int(self._cache_file["draws"])
+                assert stored >= k, (stored, k)
+                logging.info("cache_load: {} ({} draws stored, using first "
+                             "{})".format(self.cache_load, stored, k))
+            ent = self._cache_file["tasks"][self._cur_task]
+            feats = (ent["F"][:k].reshape(-1, ent["F"].shape[-1])
+                     .to(self._device))
+            labels = ent["y"][:k].reshape(-1).to(self._device)
+            if k == 1:
+                feats = feats.float()     # 1-draw runs stay fp32 end to end
+        else:
+            drawsF, drawsY = [], []
+            for d in range(k):
+                fs, ls = [], []
+                for _, data, clip_data, label in self.train_loader:
+                    fs.append(self.head.preprocess(
+                        self._network, data.to(self._device),
+                        clip_data.to(self._device)))
+                    ls.append(label.to(self._device))
+                fs, ls = torch.cat(fs), torch.cat(ls)
+                drawsF.append(fs.half() if k > 1 else fs)
+                drawsY.append(ls)
+                if k > 1 and (d + 1) % 10 == 0:
+                    logging.info("task {} cache draw {}/{}".format(
+                        self._cur_task, d + 1, k))
+            feats, labels = torch.cat(drawsF), torch.cat(drawsY)
+            if self.cache_save:
+                self._cache_dump[self._cur_task] = dict(
+                    F=torch.stack([f.half().cpu() for f in drawsF]),
+                    y=torch.stack([l.cpu() for l in drawsY]))
         self._seen_feats = (feats if self._seen_feats is None
                             else torch.cat([self._seen_feats, feats]))
         self._seen_labels = (labels if self._seen_labels is None
@@ -473,7 +541,21 @@ class Learner(VilaLearner):
 
     def _train_head(self):
         """The cheat: minibatch SGD, MSE to one-hot, over the FULL seen
-        feature cache, fresh optimizer per task (constant or cosine lr)."""
+        feature cache, fresh optimizer per task (constant or cosine lr).
+        cache_draws > 1: epochs re-expressed so TOTAL STEPS match the 1-draw
+        budget (draws are data richness, not extra compute)."""
+        n = self._seen_feats.shape[0]
+        epochs = self.head_epochs
+        if self.cache_draws > 1:
+            bs = self.head_batch_size
+            n_real = n // self.cache_draws
+            steps_target = self.head_epochs * ((n_real + bs - 1) // bs)
+            spe = (n + bs - 1) // bs
+            epochs = max(1, (steps_target + spe - 1) // spe)
+            logging.info("draw step-match: n={} ({} draws), epochs {} -> {} "
+                         "({} steps vs {} at 1 draw)".format(
+                             n, self.cache_draws, self.head_epochs, epochs,
+                             epochs * spe, steps_target))
         params = [p for p in self.head.parameters() if p.requires_grad]
         if self.head_opt == "adamw":
             opt = optim.AdamW(params, lr=self.head_lr, weight_decay=self.head_wd)
@@ -481,28 +563,27 @@ class Learner(VilaLearner):
             opt = optim.SGD(params, lr=self.head_lr, momentum=self.head_momentum,
                             weight_decay=self.head_wd)
         sched = (optim.lr_scheduler.CosineAnnealingLR(
-                     opt, T_max=self.head_epochs, eta_min=0.0)
+                     opt, T_max=epochs, eta_min=0.0)
                  if self.head_schedule == "cosine" else None)
         text_features = None
         if self.head_eval_every > 0:
             text_features = self._feat_from_temp()
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        n = self._seen_feats.shape[0]
         # train-time gaussian input noise, sigma in per-dim std units of the
         # (growing) seen cache; resampled every minibatch
         in_noise = self.args.get("head_input_noise", 0.0)
-        feat_std = self._seen_feats.std(dim=0) if in_noise > 0 else None
+        feat_std = self._feat_std() if in_noise > 0 else None
         # exact ridge match: analytic objective is sum-SE + gamma*||W||^2;
         # ours is mean-MSE, so the equivalent coefficient is gamma/(N*C)
         l2_coef = self.head_l2 / (n * self._total_classes)
         self.head.train()  # dropout active only while fitting
-        for epoch in range(1, self.head_epochs + 1):
+        for epoch in range(1, epochs + 1):
             lr_now = opt.param_groups[0]["lr"]
             perm = torch.randperm(n, device=self._device)
             loss_sum = correct = 0
             for i in range(0, n, self.head_batch_size):
                 idx = perm[i:i + self.head_batch_size]
-                X, y = self._seen_feats[idx], self._seen_labels[idx]
+                X, y = self._seen_feats[idx].float(), self._seen_labels[idx]
                 if in_noise > 0:
                     X = X + in_noise * feat_std * torch.randn_like(X)
                 opt.zero_grad(set_to_none=True)
@@ -521,26 +602,41 @@ class Learner(VilaLearner):
             train_loss, train_acc = loss_sum / n, correct / n
             test_acc = ""
             if self.head_eval_every > 0 and (epoch % self.head_eval_every == 0
-                                             or epoch == self.head_epochs):
+                                             or epoch == epochs):
                 self.head.eval()
                 test_acc = self._eval_cached(text_features)
                 self.head.train()
             print(self._cur_task, epoch, lr_now, train_loss, train_acc, test_acc,
                   file=self._head_log, sep=",")
-            if epoch % max(1, self.head_epochs // 5) == 0 or epoch == self.head_epochs:
+            if epoch % max(1, epochs // 5) == 0 or epoch == epochs:
                 logging.info(
                     "task {} head epoch {}/{} lr {:.5f} train_mse {:.6f} "
                     "train_acc {:.4f} test_acc {}".format(
-                        self._cur_task, epoch, self.head_epochs, lr_now,
+                        self._cur_task, epoch, epochs, lr_now,
                         train_loss, train_acc, test_acc))
         self.head.eval()
+
+    @torch.no_grad()
+    def _feat_std(self):
+        """Per-dim std of the seen cache, fp64 accumulators, row-chunked (a
+        5M-row fp16 cache neither materializes in fp32 nor sums stably in
+        fp16); returns fp32."""
+        n, s = self._seen_feats.shape[0], self.head_batch_size * 8
+        acc = acc2 = 0.0
+        for i in range(0, n, s):
+            x = self._seen_feats[i:i + s].double()
+            acc = acc + x.sum(dim=0)
+            acc2 = acc2 + (x * x).sum(dim=0)
+        mu = acc / n
+        return (acc2 / n - mu * mu).clamp_min_(0).sqrt().float()
 
     @torch.no_grad()
     def _hidden(self, feats):
         """vila-mimic's frozen expansion h = relu(fc0 x), float64, batched."""
         out = []
         for i in range(0, feats.shape[0], self.head_batch_size):
-            out.append(F.relu(self.head.fc0(feats[i:i + self.head_batch_size])).double())
+            out.append(F.relu(self.head.fc0(
+                feats[i:i + self.head_batch_size].float())).double())
         return torch.cat(out)
 
     @torch.no_grad()
@@ -559,6 +655,73 @@ class Learner(VilaLearner):
         gamma = float(ridges[int(np.argmin(losses))])
         logging.info("analytic head: CV-selected gamma {}".format(gamma))
         return gamma
+
+    @torch.no_grad()
+    def _solve_head_analytic_gram(self, n_prev):
+        """Wave 40: RLS-without-forgetting as one batch ridge.  Accumulate
+        G += HtH, Q += HtY in fp64 over the NEW rows (all augmentation
+        draws), solve W = (G + gamma I)^-1 Q each task.  Same fixed point as
+        head_solve=analytic at the same gamma (RLS from a ridge-consistent
+        init IS batch ridge) but stays feasible at k=100 draws, where the
+        batched Woodbury recursion costs ~50 GPU-hours.  gamma: head_l2 if
+        > 0, else the vila.py CV grid on the FIRST 2500 task-0 rows (one
+        first-draw-sized subsample, so the selection problem matches k=1)."""
+        assert isinstance(self.head, VilaMimicHead), \
+            "head_solve=analytic_gram requires head_model=vila-mimic"
+        kh = self.head.fc0.weight.shape[0]
+        C, bs = self._total_classes, self.head_batch_size
+        if self._cur_task == 0:
+            self._an_G = torch.zeros(kh, kh, dtype=torch.float64,
+                                     device=self._device)
+            self._an_Q = torch.zeros(kh, C, dtype=torch.float64,
+                                     device=self._device)
+            if self.head_l2 > 0:
+                self._an_gamma = float(self.head_l2)
+            else:
+                H0 = self._hidden(self._seen_feats[:2500])
+                Y0 = F.one_hot(self._seen_labels[:2500], C).double()
+                self._an_gamma = self._optimise_gamma(H0, Y0)
+                del H0
+        elif self._an_Q.shape[1] < C:
+            self._an_Q = F.pad(self._an_Q, (0, C - self._an_Q.shape[1]))
+        new_F = self._seen_feats[n_prev:]
+        for i in range(0, new_F.shape[0], bs):
+            Hb = F.relu(self.head.fc0(new_F[i:i + bs].float())).double()
+            Yb = F.one_hot(self._seen_labels[n_prev + i:n_prev + i + bs],
+                           C).double()
+            self._an_G += Hb.T @ Hb
+            self._an_Q += Hb.T @ Yb
+        eye = torch.eye(kh, dtype=torch.float64, device=self._device)
+        W = torch.linalg.solve(self._an_G + self._an_gamma * eye, self._an_Q)
+        if self._cur_task == 0:
+            W = self.head_task0_scale * W
+        self.head.head.weight.copy_(W.t().float())
+        # one CSV row per task: full-seen-cache metrics, batched (a 5M-row
+        # cache never materializes its hidden expansion)
+        n = self._seen_feats.shape[0]
+        loss_sum, correct = 0.0, 0
+        for i in range(0, n, bs):
+            Hb = F.relu(self.head.fc0(
+                self._seen_feats[i:i + bs].float())).double()
+            lg = Hb @ W
+            yb = self._seen_labels[i:i + bs]
+            loss_sum += F.mse_loss(lg, F.one_hot(yb, C).double(),
+                                   reduction="sum").item()
+            correct += (lg.argmax(dim=1) == yb).sum().item()
+        train_loss, train_acc = loss_sum / (n * C), correct / n
+        test_acc = ""
+        if self.head_eval_every > 0:
+            text_features = self._feat_from_temp()
+            text_features = text_features / text_features.norm(dim=-1,
+                                                               keepdim=True)
+            test_acc = self._eval_cached(text_features)
+        print(self._cur_task, 0, 0.0, train_loss, train_acc, test_acc,
+              file=self._head_log, sep=",")
+        logging.info(
+            "task {} analytic_gram solve gamma {} train_mse {:.6f} "
+            "train_acc {:.4f} test_acc {}".format(
+                self._cur_task, self._an_gamma, train_loss, train_acc,
+                test_acc))
 
     @torch.no_grad()
     def _solve_head_analytic(self, n_prev):

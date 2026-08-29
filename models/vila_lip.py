@@ -113,6 +113,14 @@ class Learner(UpperboundLearner):
         # at fit alpha alphas[i] (its own target gates + moments; the run's
         # lip_fit_sched applies PER STAGE, so cosine = warm restarts); the
         # head deploys at gate_alpha as always.  Curve tags 60+i per stage.
+        # wave 40: multi-draw joint targets (cache_draws set by the parent).
+        # The k-draw union is fitted LAZILY (fp16 rows, per-step gates) with
+        # every exact J reported against a fixed 50k-row probe subsample.
+        if self.cache_draws > 1:
+            assert self.memory_mode == "joint" and self.lip_chunks <= 1 \
+                and not (self.lip_untied_g or self.lip_fit_jitter
+                         or self.lip_fit_atom_mb), \
+                "multi-draw LIP is the plain joint arm only (wave 40)"
         aa = args.get("lip_alpha_anneal", "") or ""
         self.lip_alpha_anneal = [float(x) for x in str(aa).split(",") if x]
         if self.lip_alpha_anneal:
@@ -195,16 +203,20 @@ class Learner(UpperboundLearner):
                 logging.info(self._pt.summary())
                 return
             self._cache_task_features()
-            self._seen_count = self._seen_feats.shape[0]
+            # REAL rows seen (the head-budget ruler): draws are not new data
+            self._seen_count = self._seen_feats.shape[0] // self.cache_draws
             if last:
                 m, C = self.memory_m, self._total_classes
                 X = self._seen_feats
-                Y = F.one_hot(self._seen_labels, C).double()
+                Y = F.one_hot(self._seen_labels, C)
+                Y = Y.float() if self.cache_draws > 1 else Y.double()
                 pi = None
                 if self.lip_centred_y:
                     pi = Y.mean(dim=0)         # class priors of the seen rows
                     Y = Y - pi
-                if self.lip_chunks > 1:
+                if self.cache_draws > 1:
+                    fit = self._fit_memory_lazy(X, Y)
+                elif self.lip_chunks > 1:
                     fit = self._fit_memory_chunked(X, Y)
                 elif self.lip_alpha_anneal:
                     fit = self._fit_memory_annealed(X, Y)
@@ -457,14 +469,16 @@ class Learner(UpperboundLearner):
         return gate
 
     def _fit_memory(self, parts, B0, Y0, note, task_tag=None, m_i=None,
-                    gate=None, steps=None):
+                    gate=None, steps=None, TAR=None, eval_TAR=None):
         gate = gate or self._fit_gate()
         steps = steps or self.lip_fit_steps
-        TAR = make_target(parts, self.head.Bg, gate=gate)
+        if TAR is None:
+            TAR = make_target(parts, self.head.Bg, gate=gate)
         logging.info("task {} lip fit: target {} rows ({}), m={}, {} steps"
                      .format(self._cur_task, TAR["Z"].shape[0], note,
                              m_i or self.memory_m, steps))
         fit = fit_lip(TAR, B0, Y0, self.head.Bg, steps=steps,
+                      eval_TAR=eval_TAR,
                       fit_lr=self.lip_fit_lr, lam=self.lip_lambda_mv,
                       eval_every=self.lip_fit_eval_every,
                       adam_eps=self.lip_fit_adam_eps,
@@ -547,6 +561,32 @@ class Learner(UpperboundLearner):
         self._mem_X, self._mem_Y = B, Yat
         return dict(status="ok", B=B, Yat=Yat, snaps=snaps,
                     **{"final_" + kk: v for kk, v in fin.items()})
+
+    def _fit_memory_lazy(self, X, Y):
+        """Wave 40: joint fit against the cache_draws-augmentation union.
+        The target is LAZY -- rows stay fp16, per-step gates for the sampled
+        mb rows only, uniform weights -- because a k-draw union's
+        precomputed fp64 gates (kn x 16384) and exact J (O((kn)^2)) are
+        infeasible.  Every reported J is exact fp64 against a FIXED
+        seed-40 uniform 50k-row probe subsample of the union (eval_TAR)."""
+        m, n = self.memory_m, X.shape[0]
+        gate = self._fit_gate()
+        g = torch.Generator().manual_seed(40)
+        pidx = torch.randperm(n, generator=g)[:50000].to(X.device)
+        eval_TAR = make_target([(X[pidx].double(), Y[pidx].double(), 1.0)],
+                               self.head.Bg, gate=gate)
+        TAR = dict(Z=X, Y=Y.float(),
+                   w=torch.full((n,), 1.0 / n, dtype=torch.float32,
+                                device=X.device),
+                   G=None, gate=gate)
+        draw = self._draw_init(self._seen_labels, m)
+        B0, Y0 = X[draw].float(), Y[draw].float()
+        logging.info("lazy joint fit: {} rows ({} draws), probe 50000"
+                     .format(n, self.cache_draws))
+        return self._fit_memory(None, B0, Y0,
+                                "joint x{} draws, probe-J".format(
+                                    self.cache_draws),
+                                TAR=TAR, eval_TAR=eval_TAR)
 
     def _fit_memory_annealed(self, X, Y):
         """Wave 37: staged fit-alpha anneal.  len(alphas) sequential

@@ -209,7 +209,8 @@ def _rms(t):
 def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
             dtype=torch.float32, mb=0, jitter=0.0, snapshot_best=False,
             sched="const", snap_steps=(), wm_chunk=8192, ste=False,
-            atom_mb=0, atom_mode="naive", untied_g=False, verbose=print):
+            atom_mb=0, atom_mode="naive", untied_g=False, eval_TAR=None,
+            verbose=print):
     """One LIP fit: Adam on free natural-scale (atoms, targets), init (B0, Y0)
     -- the warm start IS the init (no redraw, no Y* solve) -- minimizing the
     exact full-batch J against the weighted target.  RELATIVE lr: each param
@@ -247,6 +248,15 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
                            UNBIASED for J and its gradient, cost linear in m;
                   'ind'    quadratic = two INDEPENDENT subsets (atom_mb x
                            atom_mb), cross = full-atom -- also unbiased.
+    eval_TAR      wave 40 PROBE target: when given, EVERY exact fp64 eval
+                  (curve, snaps, final, S constants for reported J values)
+                  runs against eval_TAR instead of TAR; the step loop still
+                  samples the (possibly huge) TAR.  Use with a LAZY TAR --
+                  G=None (target gates derived per step for the sampled mb
+                  rows, never precomputed) and Z stored fp16/fp32 (cast to
+                  the fit dtype after indexing) -- so a k-draw union target
+                  whose exact J is O(n^2)-infeasible still fits.  A lazy TAR
+                  requires mb > 0 and excludes jitter.
     untied_g      wave 36: the per-atom gates become a FREE real parameter
                   (m x k), initialized at the tied value gates(B0) and
                   optimized jointly (own Adam group at fit_lr * its init
@@ -263,7 +273,11 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
     -> dict(B fp32, Yat fp32, curve, snaps, status, best_step, final_*)."""
     assert not torch.backends.cuda.matmul.allow_tf32, \
         "TF32 breaks the fp32 mask-Gram exactness argument"
-    mom = wmoments(TAR, chunk=wm_chunk)
+    ETAR = eval_TAR if eval_TAR is not None else TAR
+    if TAR["G"] is None:                  # lazy target (wave 40)
+        assert mb > 0 and jitter == 0.0 and eval_TAR is not None, \
+            "a lazy TAR needs the mb estimator, no jitter, and a probe"
+    mom = wmoments(ETAR, chunk=wm_chunk)
     Bp = B0.detach().to(dtype).clone().requires_grad_(True)
     Yp = Y0.detach().to(dtype).clone().requires_grad_(True)
     m = Bp.shape[0]
@@ -291,7 +305,11 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
     assert all(0 < s < steps for s in snap_set), \
         f"snap_steps must lie inside the fit: {sorted(snap_set)} vs {steps}"
     snaps = []
-    Z_f, Y_f = TAR["Z"].to(dtype), TAR["Y"].to(dtype)
+    # fp16-stored Z stays fp16 until indexed (a 5M-row union in fp32 would
+    # not fit); sampled rows are cast to the fit dtype per step
+    Z_f = (TAR["Z"] if TAR["Z"].dtype == torch.float16
+           else TAR["Z"].to(dtype))
+    Y_f = TAR["Y"].to(dtype)
     w_f, Bg_f = TAR["w"].to(dtype), Bg.to(dtype)
     g_act, g_scale, *g_al = TAR.get("gate", ("step", 1.0))
     g_alpha = g_al[0] if g_al else 1.0
@@ -308,7 +326,7 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
 
     def snapshot(step):
         with torch.no_grad():
-            sn = exact_state(Bp, Yp, TAR, mom, lam, Bg, G=Gp)
+            sn = exact_state(Bp, Yp, ETAR, mom, lam, Bg, G=Gp)
             flip = (((Gp.detach() > 0.5) != G0u) if untied_g
                     else (masks(Bp.detach(), Bg_f) != G0))
             sn.update(step=int(step),
@@ -332,7 +350,9 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
         Z_t, Y_t, w_t, G_t = Z_f, Y_f, w_f, TAR["G"]
         if mb:
             idx = torch.multinomial(w_f, mb, replacement=True)
-            Z_t, Y_t, G_t, w_t = Z_f[idx], Y_f[idx], TAR["G"][idx], w_mb
+            Z_t, Y_t, w_t = Z_f[idx].to(dtype), Y_f[idx], w_mb
+            G_t = (gates(Z_t, Bg_f, g_act, g_scale, g_alpha)
+                   if TAR["G"] is None else TAR["G"][idx])
         if jitter > 0:
             Z_t = Z_t + jitter * Z_std * torch.randn_like(Z_t)
             G_t = gates(Z_t, Bg_f, g_act, g_scale, g_alpha)  # tied jitter
@@ -383,7 +403,7 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
     if snapshot_best and best["B"] is not None:
         B_out, Y_out, best_step = best["B"], best["Y"], best["step"]
         G_out = best.get("G")
-    fin = exact_state(B_out, Y_out, TAR, mom, lam, Bg, G=G_out)
+    fin = exact_state(B_out, Y_out, ETAR, mom, lam, Bg, G=G_out)
     B_out, Y_out = B_out.float().clone(), Y_out.float().clone()
     G_out = None if G_out is None else G_out.float().clone()
     verbose(f"  [fit lip m={m}] {status} J={fin['J']:.6e} J_M={fin['J_M']:.3e} "
@@ -604,6 +624,31 @@ def selftest():
     assert f_un["final_J"] < f_tie["final_J"], \
         f"untied did not beat tied: {f_un['final_J']} vs {f_tie['final_J']}"
     assert f_tie["G"] is None, "tied fit must not return gates"
+
+    # 15. lazy target + probe (wave 40).  A lazy TAR (G=None, fp32 rows,
+    #     uniform weights) with eval_TAR = the full precomputed target:
+    #     J0 equals the tied fit's J0 exactly (the probe IS the target
+    #     here), the mb fit improves the probe J, and the final reported J
+    #     matches an independent exact_state of the returned atoms.
+    # TG has non-uniform part weights; use a uniform-weight twin so the
+    # lazy uniform-w TAR matches its probe exactly
+    ZU = torch.cat([Z1, Z2])
+    YU = torch.cat([Y1, Y2])
+    TU2 = make_target([(ZU, YU, 1.0)], Bg, gate=gt)
+    TL = dict(Z=ZU.float(), Y=YU.float(),
+              w=torch.full((ZU.shape[0],), 1.0 / ZU.shape[0],
+                           dtype=torch.float32), G=None, gate=gt)
+    f_lz = fit_lip(TL, B, Yat, Bg, steps=300, fit_lr=1e-2, lam=0.5,
+                   eval_every=100, adam_eps=1e-8, dtype=torch.float64,
+                   mb=16, eval_TAR=TU2, verbose=lambda *a: None)
+    st_u2 = exact_state(B, Yat, TU2, wmoments(TU2), 0.5, Bg)
+    ok(f_lz["curve"]["J"][0], st_u2["J"], "lazy J0 == exact vs probe",
+       tol=1e-9)
+    assert f_lz["status"] == "ok" and f_lz["final_J"] < 0.7 * st_u2["J"], \
+        f"lazy fit did not improve: {f_lz['final_J']} vs {st_u2['J']}"
+    st_lz = exact_state(f_lz["B"].double(), f_lz["Yat"].double(), TU2,
+                        wmoments(TU2), 0.5, Bg)
+    ok(st_lz["J"], f_lz["final_J"], "lazy final == exact_state", tol=1e-6)
 
     print(f"[lip_fit selftest] ALL OK (fit J {st['J']:.3e} -> "
           f"{f['final_J']:.3e}; mb unbiased within {se:.1e}; jitter fit "
