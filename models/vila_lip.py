@@ -450,7 +450,7 @@ class Learner(UpperboundLearner):
         warm start drawn from the chunk's own rows), memory = the union at
         uniform 1/m.  Exact within chunk, biased at the problem level (each
         chunk matches a different target).  lip_curves.csv: task 80+i =
-        chunk i's exact-J curve vs ITS OWN chunk target; task 88 = the
+        chunk i's exact-J curve vs ITS OWN chunk target; task 99 = the
         union's exact fp64 J vs the FULL 50k target (snap steps + final,
         g_flip_frac = nan there: no single init mask set)."""
         from models.lip_fit import exact_state, wmoments
@@ -487,11 +487,11 @@ class Learner(UpperboundLearner):
                 Ys = torch.cat([f["snaps"][j]["Y"] for f in fits])
                 st = exact_state(Bs, Ys, TARf, momf, lam, self.head.Bg)
                 snaps.append(dict(step=int(s), J=st["J"], B=Bs, Y=Ys))
-                print(88, s, st["J"], st["J_M"], st["J_V"],
+                print(99, s, st["J"], st["J_M"], st["J_V"],
                       st["x_norm_mean"], st["y_norm_mean"], nan,
                       file=self._lip_log, sep=",")
             fin = exact_state(B, Yat, TARf, momf, lam, self.head.Bg)
-            print(88, self.lip_fit_steps, fin["J"], fin["J_M"], fin["J_V"],
+            print(99, self.lip_fit_steps, fin["J"], fin["J_M"], fin["J_V"],
                   fin["x_norm_mean"], fin["y_norm_mean"], nan,
                   file=self._lip_log, sep=",")
         logging.info("chunked union (k={}): m={} exact J={:.6e} J_M={:.3e} "
