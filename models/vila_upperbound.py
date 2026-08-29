@@ -232,9 +232,13 @@ class AGaLUHead(nn.Module):
         new.weight[: old.shape[0]] = old
         self.head = new
 
-    def forward(self, features):
-        g = GATE_ACTS[self.gate_act](
-            self.gate_alpha * (features @ self.Bg.T)) / self.gate_scale
+    def forward(self, features, g_override=None):
+        # g_override (wave 36): untied per-row gates used verbatim (already
+        # post-scale, exactly what gates() / the lip fit stores) -- memory
+        # rows carry their gates as data; test rows stay tied (no override)
+        g = (g_override if g_override is not None
+             else GATE_ACTS[self.gate_act](
+                 self.gate_alpha * (features @ self.Bg.T)) / self.gate_scale)
         h = g * (features @ self.W1.T)
         return {"buffer_feature": h, "logits": self.head(self.drop(h))}
 

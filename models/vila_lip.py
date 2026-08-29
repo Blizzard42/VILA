@@ -87,6 +87,14 @@ class Learner(UpperboundLearner):
             "atom subsampling and chunking are separate arms"
         if self.lip_chunks > 1:
             assert self.memory_mode == "joint", "chunking is a joint-fit arm"
+        # wave 36: untied per-atom gates -- the memory becomes (x, g, y)
+        # triples; the head consumes the stored g for memory rows (test rows
+        # stay tied).  Joint mode only, excludes chunks/atom_mb/ste.
+        self.lip_untied_g = args.get("lip_untied_g", False)
+        if self.lip_untied_g:
+            assert self.memory_mode == "joint", "untied_g is a joint-fit arm"
+            assert not (self.lip_chunks > 1 or self.lip_fit_atom_mb
+                        or self.lip_fit_ste), "untied_g excludes those arms"
         # wave 31.1: lip-specific phases on the shared PhaseTimer (chunked
         # runs accumulate one lip_fit count per chunk; union_eval is timed
         # inline in _fit_memory_chunked)
@@ -100,6 +108,22 @@ class Learner(UpperboundLearner):
         # one).  None = same alpha as the head (the default, all prior waves).
         la = args.get("lip_fit_alpha", None)
         self.lip_fit_alpha = None if la in (None, "") else float(la)
+        # wave 37: staged fit-alpha anneal "8,16,32" -- the joint fit runs as
+        # len(alphas) sequential warm-started fits of steps/len each, stage i
+        # at fit alpha alphas[i] (its own target gates + moments; the run's
+        # lip_fit_sched applies PER STAGE, so cosine = warm restarts); the
+        # head deploys at gate_alpha as always.  Curve tags 60+i per stage.
+        aa = args.get("lip_alpha_anneal", "") or ""
+        self.lip_alpha_anneal = [float(x) for x in str(aa).split(",") if x]
+        if self.lip_alpha_anneal:
+            assert self.memory_mode == "joint" and self.lip_chunks <= 1, \
+                "alpha anneal is a joint, unchunked arm"
+            assert self.lip_fit_alpha is None and not self.lip_untied_g, \
+                "alpha anneal excludes lip_fit_alpha/untied_g"
+            assert not self.lip_snap_steps, \
+                "alpha anneal stages break the snap<steps invariant"
+            assert not self.args.get("gate_norm", False), \
+                "per-stage gate_norm scale not implemented"
         # wave 15: warm-start draw rule for the first fit (uniform | balanced)
         self.lip_init_draw = args.get("lip_init_draw", "uniform")
         assert self.lip_init_draw in ("uniform", "balanced")
@@ -114,6 +138,8 @@ class Learner(UpperboundLearner):
                 "joint mode fits a full-dataset target: mb estimator required"
         self._seen_count = 0            # real rows seen so far (the weights)
         self._mem_X = self._mem_Y = None  # Y: fp32 [m, C] (lip) | int labels
+        self._mem_G = None              # untied gates [m, k] (wave 36) | None
+        self._seen_G = None             # gates for the CURRENT head-train set
         self._lip_log = None
         if self.memory_mode in ("lip", "joint"):
             init_cls = 0 if args["init_cls"] == args["increment"] else args["init_cls"]
@@ -180,6 +206,8 @@ class Learner(UpperboundLearner):
                     Y = Y - pi
                 if self.lip_chunks > 1:
                     fit = self._fit_memory_chunked(X, Y)
+                elif self.lip_alpha_anneal:
+                    fit = self._fit_memory_annealed(X, Y)
                 else:
                     draw = self._draw_init(self._seen_labels, m)
                     logging.info("joint init draw ({}): {} rows, class counts "
@@ -194,22 +222,30 @@ class Learner(UpperboundLearner):
                 if self.memory_save:
                     allsn = fit["snaps"] + [dict(step=self.lip_fit_steps,
                                                  J=fit["final_J"], B=fit["B"],
-                                                 Y=fit["Yat"])]
+                                                 Y=fit["Yat"],
+                                                 **({} if fit.get("G") is None
+                                                    else dict(G=fit["G"])))]
                     torch.save(dict(Bg=self.head.Bg.detach().cpu(),
                                     seen_count=int(self._seen_count),
                                     centred=bool(self.lip_centred_y),
                                     pi=None if pi is None else pi.cpu(),
                                     snaps=[dict(step=s["step"], J=s["J"],
-                                                B=s["B"].cpu(), Y=s["Y"].cpu())
+                                                B=s["B"].cpu(), Y=s["Y"].cpu(),
+                                                **({} if s.get("G") is None
+                                                   else dict(G=s["G"].cpu())))
                                            for s in allsn]),
                                self._stem + "_memory.pt")
                     logging.info("memory payload ({} snaps) -> {}".format(
                         len(allsn), self._stem + "_memory.pt"))
                 for i, s in enumerate(fit["snaps"]):
                     self._train_snap_head(s["B"].to(self._device),
-                                          s["Y"].to(self._device), 71 + i)
+                                          s["Y"].to(self._device), 71 + i,
+                                          G=None if s.get("G") is None
+                                          else s["G"].to(self._device))
                 self._seen_feats, self._seen_labels = self._mem_X, self._mem_Y
+                self._seen_G = self._mem_G
                 self._train_head()
+                self._seen_G = None
             logging.info(self._pt.summary())
             return
 
@@ -257,11 +293,12 @@ class Learner(UpperboundLearner):
         self._test_labels = (labels if self._test_labels is None
                              else torch.cat([self._test_labels, labels]))
 
-    def _train_snap_head(self, X, Y, marker):
+    def _train_snap_head(self, X, Y, marker, G=None):
         """Train a FRESH head (new W1 draw, zeroed output, SAME Bg -- the
         memory lives in this run's gate space) on one mid-fit memory
         snapshot, logged under `marker` in the head CSV; then restore the
-        original never-trained head for the final memory's own training."""
+        original never-trained head for the final memory's own training.
+        G (wave 36): the snapshot's untied gates, if any."""
         logging.info("snapshot head training (task marker {})".format(marker))
         orig, ct = self.head, self._cur_task
         in_features = self.feature_dim + self._network.clip.out_dim
@@ -271,10 +308,12 @@ class Learner(UpperboundLearner):
         head.append_task(self._total_classes)
         self.head = self._network.ac_model = head
         self._seen_feats, self._seen_labels, self._cur_task = X, Y, marker
+        self._seen_G = G
         try:
             self._train_head()
         finally:
             self.head, self._network.ac_model, self._cur_task = orig, orig, ct
+            self._seen_G = None
 
     def _head_from_memory(self):
         """Stage B (wave 7): load a saved memory payload, adopt its Bg (the
@@ -290,6 +329,8 @@ class Learner(UpperboundLearner):
         self._seen_count = int(pay["seen_count"])
         self._seen_feats = s["B"].to(self._device)
         self._seen_labels = s["Y"].to(self._device)
+        self._seen_G = (None if s.get("G") is None
+                        else s["G"].to(self._device))
         logging.info("head_from_memory: {} snap step {} ({} rows, centred={},"
                      " budget x{})".format(self.head_from_memory, step,
                                            self._seen_feats.shape[0],
@@ -311,10 +352,12 @@ class Learner(UpperboundLearner):
         self.head.append_task(self._total_classes)
         self._network.ac_model = self.head
         ct, self._cur_task = self._cur_task, 99
+        self._seen_G = self._mem_G
         try:
             self._train_head()
         finally:
             self._cur_task = ct
+            self._seen_G = None
 
     # ---------------------------------------------------------------- memory
     def _update_memory(self, new_X, new_y, N_prev):
@@ -413,13 +456,15 @@ class Learner(UpperboundLearner):
             gate = (g_act, g_scale, self.lip_fit_alpha)
         return gate
 
-    def _fit_memory(self, parts, B0, Y0, note, task_tag=None, m_i=None):
-        gate = self._fit_gate()
+    def _fit_memory(self, parts, B0, Y0, note, task_tag=None, m_i=None,
+                    gate=None, steps=None):
+        gate = gate or self._fit_gate()
+        steps = steps or self.lip_fit_steps
         TAR = make_target(parts, self.head.Bg, gate=gate)
         logging.info("task {} lip fit: target {} rows ({}), m={}, {} steps"
                      .format(self._cur_task, TAR["Z"].shape[0], note,
-                             m_i or self.memory_m, self.lip_fit_steps))
-        fit = fit_lip(TAR, B0, Y0, self.head.Bg, steps=self.lip_fit_steps,
+                             m_i or self.memory_m, steps))
+        fit = fit_lip(TAR, B0, Y0, self.head.Bg, steps=steps,
                       fit_lr=self.lip_fit_lr, lam=self.lip_lambda_mv,
                       eval_every=self.lip_fit_eval_every,
                       adam_eps=self.lip_fit_adam_eps,
@@ -431,11 +476,13 @@ class Learner(UpperboundLearner):
                       ste=self.lip_fit_ste,
                       atom_mb=self.lip_fit_atom_mb,
                       atom_mode=self.lip_fit_atom_mode,
+                      untied_g=self.lip_untied_g,
                       verbose=lambda s: logging.info(s.strip()))
         if fit["status"] != "ok":
             raise RuntimeError("lip fit diverged at task {} step {}".format(
                 self._cur_task, fit["diverged_at"]))
         self._mem_X, self._mem_Y = fit["B"], fit["Yat"]
+        self._mem_G = fit.get("G")               # untied runs only, else None
         tag = self._cur_task if task_tag is None else task_tag
         for i in range(len(fit["curve"]["step"])):
             print(tag, *[fit["curve"][k][i] for k in LIP_CURVE],
@@ -501,6 +548,34 @@ class Learner(UpperboundLearner):
         return dict(status="ok", B=B, Yat=Yat, snaps=snaps,
                     **{"final_" + kk: v for kk, v in fin.items()})
 
+    def _fit_memory_annealed(self, X, Y):
+        """Wave 37: staged fit-alpha anneal.  len(alphas) sequential
+        warm-started fits of ~steps/len each; stage i builds its OWN target
+        (gates + moments) at alpha alphas[i] (act/scale from the head, as
+        _fit_gate does) and warm-starts from the previous stage's atoms; the
+        run's lip_fit_sched applies per stage (cosine = warm restarts).  The
+        LAST alpha should equal the head's gate_alpha.  Curve tags 60+i."""
+        alphas, m = self.lip_alpha_anneal, self.memory_m
+        act = getattr(self.head, "gate_act", "step")
+        scale = float(getattr(self.head, "gate_scale", 1.0))
+        if float(alphas[-1]) != float(self.head.gate_alpha):
+            logging.info("WARNING: anneal ends at alpha {} != head alpha {}"
+                         .format(alphas[-1], self.head.gate_alpha))
+        k, total = len(alphas), self.lip_fit_steps
+        per = total // k
+        draw = self._draw_init(self._seen_labels, m)
+        B0, Y0 = X[draw], Y[draw].float()
+        logging.info("alpha anneal: stages {} x ~{} steps".format(
+            alphas, per))
+        for i, al in enumerate(alphas):
+            st = per if i < k - 1 else total - per * (k - 1)
+            fit = self._fit_memory(
+                [(X.double(), Y, 1.0)], B0, Y0,
+                "anneal stage {}/{} alpha={}".format(i, k, al),
+                task_tag=60 + i, gate=(act, scale, float(al)), steps=st)
+            B0, Y0 = fit["B"], fit["Yat"]
+        return fit
+
     # ---------------------------------------------------------------- train
     def _train_head(self):
         """Parent loop with two changes: (1) step-matched epoch budget --
@@ -542,7 +617,11 @@ class Learner(UpperboundLearner):
                 if in_noise > 0:
                     X = X + in_noise * feat_std * torch.randn_like(X)
                 opt.zero_grad(set_to_none=True)
-                logits = self.head(X)["logits"]
+                # wave 36: untied memories carry their gates as DATA -- the
+                # stored g is used verbatim (input noise jitters x only)
+                logits = (self.head(X)["logits"] if self._seen_G is None
+                          else self.head(X, g_override=self._seen_G[idx])
+                          ["logits"])
                 tgt = (y.to(logits.dtype) if soft
                        else F.one_hot(y, self._total_classes).to(logits.dtype))
                 loss = F.mse_loss(logits, tgt)

@@ -179,12 +179,14 @@ def _J_terms_split(B, Yat, G_B, iL, iR, Z, Y, w, G, S_M, S_V, lam):
     return lam * J_M + (1.0 - lam) * J_V
 
 
-def exact_state(B, Yat, TAR, mom, lam, Bg):
+def exact_state(B, Yat, TAR, mom, lam, Bg, G=None):
     """THE exact fp64 (M, V) evaluator: every reported J goes through
     literally this expression.  Gates derived from the atoms (tied), with
-    the target's own gate activation."""
+    the target's own gate activation; G (wave 36) = UNTIED per-atom gates,
+    used verbatim instead of deriving from the atoms."""
     Bd, Yd = B.detach().double(), Yat.detach().double()
-    G_B = gates(Bd, Bg.double(), *TAR.get("gate", ("step", 1.0)))
+    G_B = (G.detach().double() if G is not None
+           else gates(Bd, Bg.double(), *TAR.get("gate", ("step", 1.0))))
     J, J_M, J_V = _J_terms(Bd, Yd, G_B, TAR["Z"], TAR["Y"], TAR["w"],
                            TAR["G"], mom["S_M"], mom["S_V"], lam)
     J_M = _nonneg(float(J_M.item()), (mom["S_M"], 1.0), "J_M")
@@ -207,7 +209,7 @@ def _rms(t):
 def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
             dtype=torch.float32, mb=0, jitter=0.0, snapshot_best=False,
             sched="const", snap_steps=(), wm_chunk=8192, ste=False,
-            atom_mb=0, atom_mode="naive", verbose=print):
+            atom_mb=0, atom_mode="naive", untied_g=False, verbose=print):
     """One LIP fit: Adam on free natural-scale (atoms, targets), init (B0, Y0)
     -- the warm start IS the init (no redraw, no Y* solve) -- minimizing the
     exact full-batch J against the weighted target.  RELATIVE lr: each param
@@ -245,6 +247,14 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
                            UNBIASED for J and its gradient, cost linear in m;
                   'ind'    quadratic = two INDEPENDENT subsets (atom_mb x
                            atom_mb), cross = full-atom -- also unbiased.
+    untied_g      wave 36: the per-atom gates become a FREE real parameter
+                  (m x k), initialized at the tied value gates(B0) and
+                  optimized jointly (own Adam group at fit_lr * its init
+                  rms).  Atoms stop being points with derived gates and
+                  become (x, g, y) triples; every exact eval uses the stored
+                  g; g_flip_frac becomes the fraction of g crossing the 0.5
+                  mask threshold vs init (sigmoid-centric).  The payload and
+                  snaps gain a "G" entry.  Not combinable with ste/atom_mb.
 
     Gates follow TAR["gate"] = (act, scale); smooth acts are differentiable
     in the atoms, so their gradient flows through the gate term naturally.
@@ -257,9 +267,18 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
     Bp = B0.detach().to(dtype).clone().requires_grad_(True)
     Yp = Y0.detach().to(dtype).clone().requires_grad_(True)
     m = Bp.shape[0]
-    opt = torch.optim.Adam(
-        [dict(params=[Bp], lr=fit_lr * _rms(Bp)),
-         dict(params=[Yp], lr=fit_lr * _rms(Yp))], eps=adam_eps)
+    groups = [dict(params=[Bp], lr=fit_lr * _rms(Bp)),
+              dict(params=[Yp], lr=fit_lr * _rms(Yp))]
+    Gp = G0u = None
+    if untied_g:
+        assert not (ste or atom_mb), "untied_g excludes ste/atom_mb"
+        ga, gs, *gal = TAR.get("gate", ("step", 1.0))
+        Gp = gates(B0.detach().to(dtype), Bg.to(dtype), ga, gs,
+                   gal[0] if gal else 1.0)
+        Gp = Gp.to(dtype).clone().requires_grad_(True)
+        G0u = (Gp.detach() > 0.5).clone()
+        groups.append(dict(params=[Gp], lr=fit_lr * _rms(Gp)))
+    opt = torch.optim.Adam(groups, eps=adam_eps)
     assert sched in ("const", "cosine"), sched
     scheduler = (torch.optim.lr_scheduler.LambdaLR(
         opt, lambda t: 0.5 * (1.0 + math.cos(math.pi * min(t, steps)
@@ -289,19 +308,23 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
 
     def snapshot(step):
         with torch.no_grad():
-            sn = exact_state(Bp, Yp, TAR, mom, lam, Bg)
+            sn = exact_state(Bp, Yp, TAR, mom, lam, Bg, G=Gp)
+            flip = (((Gp.detach() > 0.5) != G0u) if untied_g
+                    else (masks(Bp.detach(), Bg_f) != G0))
             sn.update(step=int(step),
-                      g_flip_frac=float((masks(Bp.detach(), Bg_f) != G0)
-                                        .double().mean().item()))
+                      g_flip_frac=float(flip.double().mean().item()))
             for k in LIP_CURVE:
                 curve[k].append(sn[k])
             if snapshot_best and sn["J"] < best["J"]:
                 best.update(J=sn["J"], step=int(step),
-                            B=Bp.detach().clone(), Y=Yp.detach().clone())
+                            B=Bp.detach().clone(), Y=Yp.detach().clone(),
+                            G=None if Gp is None else Gp.detach().clone())
             if step in snap_set:
                 snaps.append(dict(step=int(step), J=sn["J"],
                                   B=Bp.detach().float().clone(),
-                                  Y=Yp.detach().float().clone()))
+                                  Y=Yp.detach().float().clone(),
+                                  **({} if Gp is None else
+                                     dict(G=Gp.detach().float().clone()))))
         return sn
 
     snapshot(0)
@@ -327,7 +350,9 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
             loss = _J_terms_split(Bp, Yp, G_B, iL, iR, Z_t, Y_t, w_t, G_t,
                                   mom["S_M"], mom["S_V"], lam)
         else:
-            if ste:
+            if untied_g:
+                G_B = Gp                          # free gates, grad flows
+            elif ste:
                 z_pre = Bp @ Bg_f.T
                 s = torch.sigmoid(z_pre)          # forward = step, backward =
                 G_B = ((z_pre > 0).to(dtype) - s).detach() + s   # d(sigmoid)
@@ -354,16 +379,19 @@ def fit_lip(TAR, B0, Y0, Bg, steps, fit_lr, lam, eval_every, adam_eps,
                         f"J_V={sn['J_V']:.3e} flip={sn['g_flip_frac']:.4f}")
 
     B_out, Y_out, best_step = Bp.detach(), Yp.detach(), None
+    G_out = None if Gp is None else Gp.detach()
     if snapshot_best and best["B"] is not None:
         B_out, Y_out, best_step = best["B"], best["Y"], best["step"]
-    fin = exact_state(B_out, Y_out, TAR, mom, lam, Bg)
+        G_out = best.get("G")
+    fin = exact_state(B_out, Y_out, TAR, mom, lam, Bg, G=G_out)
     B_out, Y_out = B_out.float().clone(), Y_out.float().clone()
+    G_out = None if G_out is None else G_out.float().clone()
     verbose(f"  [fit lip m={m}] {status} J={fin['J']:.6e} J_M={fin['J_M']:.3e} "
             f"J_V={fin['J_V']:.3e} J0={curve['J'][0]:.3e} "
             + (f"(best snapshot step {best_step}) " if best_step is not None
                else "") + f"({time.time() - t0:.0f}s)")
     return dict(status=status, diverged_at=diverged_at, curve=curve,
-                B=B_out, Yat=Y_out, best_step=best_step, snaps=snaps,
+                B=B_out, Yat=Y_out, G=G_out, best_step=best_step, snaps=snaps,
                 **{f"final_{k}": v for k, v in fin.items()}, **mom)
 
 
@@ -553,11 +581,36 @@ def selftest():
         assert fa["status"] == "ok" and fa["final_J"] < 0.7 * st["J"], \
             f"atom_mb {mode} fit did not improve: {fa['final_J']} vs {st['J']}"
 
+    # 14. untied gates (wave 36).  At init the free gates ARE the tied ones,
+    #     so J0 matches the tied fit's J0 exactly; the gradient reaches G
+    #     (the gates move); exact_state with the returned G reproduces the
+    #     reported final J; a short fit beats the TIED fit's J (a superset
+    #     parametrization from the same init); tied fit is unaffected.
+    f_tie = fit_lip(TG, B, Yat, Bg, steps=300, fit_lr=1e-2, lam=0.5,
+                    eval_every=100, adam_eps=1e-8, dtype=torch.float64,
+                    verbose=lambda *a: None)
+    f_un = fit_lip(TG, B, Yat, Bg, steps=300, fit_lr=1e-2, lam=0.5,
+                   eval_every=100, adam_eps=1e-8, dtype=torch.float64,
+                   untied_g=True, verbose=lambda *a: None)
+    ok(f_un["curve"]["J"][0], f_tie["curve"]["J"][0], "untied J0 == tied J0",
+       tol=1e-12)
+    G_init = gates(B, Bg, *gt)
+    d_g = float((f_un["G"].double() - G_init).abs().max().item())
+    assert d_g > 1e-8, "untied gates did not move"
+    st_un = exact_state(f_un["B"].double(), f_un["Yat"].double(), TG, momg,
+                        0.5, Bg, G=f_un["G"].double())
+    ok(st_un["J"], f_un["final_J"], "untied exact_state(G) == reported",
+       tol=1e-6)   # fp32 round-trip of the returned (B, Y, G)
+    assert f_un["final_J"] < f_tie["final_J"], \
+        f"untied did not beat tied: {f_un['final_J']} vs {f_tie['final_J']}"
+    assert f_tie["G"] is None, "tied fit must not return gates"
+
     print(f"[lip_fit selftest] ALL OK (fit J {st['J']:.3e} -> "
           f"{f['final_J']:.3e}; mb unbiased within {se:.1e}; jitter fit "
           f"{fj['final_J']:.3e}; snapshot best step {fs['best_step']}; "
           f"cosine {fc['final_J']:.3e}; {len(fp_['snaps'])} snap payloads; "
-          f"tanh fit {fg['final_J']:.3e}; STE atom delta {d_ste:.2e})")
+          f"tanh fit {fg['final_J']:.3e}; STE atom delta {d_ste:.2e}; "
+          f"untied {f_un['final_J']:.3e} < tied {f_tie['final_J']:.3e})")
 
 
 if __name__ == "__main__":
