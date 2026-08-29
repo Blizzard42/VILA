@@ -83,6 +83,13 @@ class Learner(UpperboundLearner):
         self.lip_fit_atom_mb = int(args.get("lip_fit_atom_mb", 0) or 0)
         self.lip_fit_atom_mode = args.get("lip_fit_atom_mode", "naive")
         self.lip_chunks = int(args.get("lip_chunks", 0) or 0)
+        # wave 42: chunk partition rule.  "stratified" (default, waves
+        # 31/32) deals every class round-robin across chunks; "class"
+        # partitions the LABEL SPACE into k contiguous blocks (labels are
+        # task-ordered, so k=20 on T20 is per-task distillation) -- each
+        # chunk fits only its own classes' rows.
+        self.lip_chunk_mode = args.get("lip_chunk_mode", "stratified")
+        assert self.lip_chunk_mode in ("stratified", "class")
         assert not (self.lip_fit_atom_mb and self.lip_chunks > 1), \
             "atom subsampling and chunking are separate arms"
         if self.lip_chunks > 1:
@@ -510,20 +517,36 @@ class Learner(UpperboundLearner):
         subproblem: full frontier recipe, mb estimator within the chunk,
         warm start drawn from the chunk's own rows), memory = the union at
         uniform 1/m.  Exact within chunk, biased at the problem level (each
-        chunk matches a different target).  lip_curves.csv: task 80+i =
-        chunk i's exact-J curve vs ITS OWN chunk target; task 99 = the
-        union's exact fp64 J vs the FULL 50k target (snap steps + final,
-        g_flip_frac = nan there: no single init mask set)."""
+        chunk matches a different target).  lip_curves.csv: task 100+i =
+        chunk i's exact-J curve vs ITS OWN chunk target (waves 31/32 used
+        80+i, moved for k=20); task 99 = the union's exact fp64 J vs the
+        FULL 50k target (snap steps + final, g_flip_frac = nan there: no
+        single init mask set).  lip_chunk_mode="class" (wave 42):
+        contiguous label blocks instead of within-class round-robin."""
         from models.lip_fit import exact_state, wmoments
         k, m, y = self.lip_chunks, self.memory_m, self._seen_labels
         gate = self._fit_gate()
-        chunks = [[] for _ in range(k)]
-        for c in torch.unique(y).tolist():
-            rows = torch.nonzero(y == c, as_tuple=True)[0]
-            rows = rows[torch.randperm(rows.numel(), device=rows.device)]
+        if self.lip_chunk_mode == "class":
+            cls = torch.unique(y).sort().values.tolist()
+            per = [len(cls) // k + (1 if i < len(cls) % k else 0)
+                   for i in range(k)]
+            chunks, lo = [], 0
             for i in range(k):
-                chunks[i].append(rows[i::k])
-        chunks = [torch.cat(ch) for ch in chunks]
+                grp = cls[lo:lo + per[i]]
+                lo += per[i]
+                chunks.append(torch.nonzero(
+                    torch.isin(y, torch.tensor(grp, device=y.device)),
+                    as_tuple=True)[0])
+            logging.info("class chunking: {} classes into {} blocks {}"
+                         .format(len(cls), k, per))
+        else:
+            chunks = [[] for _ in range(k)]
+            for c in torch.unique(y).tolist():
+                rows = torch.nonzero(y == c, as_tuple=True)[0]
+                rows = rows[torch.randperm(rows.numel(), device=rows.device)]
+                for i in range(k):
+                    chunks[i].append(rows[i::k])
+            chunks = [torch.cat(ch) for ch in chunks]
         ms = [m // k + (1 if i < m % k else 0) for i in range(k)]
         fits = []
         for i, (rows, mi) in enumerate(zip(chunks, ms)):
@@ -532,8 +555,9 @@ class Learner(UpperboundLearner):
             fits.append(self._fit_memory(
                 [(X[rows].double(), Y[rows], 1.0)],
                 X[draw], Y[draw].float(),
-                "chunk {}/{} m_i={}".format(i, k, mi),
-                task_tag=80 + i, m_i=mi))
+                "chunk {}/{} ({}) m_i={}".format(i, k, self.lip_chunk_mode,
+                                                 mi),
+                task_tag=100 + i, m_i=mi))
         B = torch.cat([f["B"] for f in fits])
         Yat = torch.cat([f["Yat"] for f in fits])
         # the union's exact J vs the FULL target (the comparable number)
