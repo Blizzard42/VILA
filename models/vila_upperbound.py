@@ -393,7 +393,10 @@ class Learner(VilaLearner):
             args["model_name"], args["dataset"], init_cls, args["increment"],
             args["prefix"], args["seed"], args["backbone_type"])
         self._head_log = open(stem + "_head_curves.csv", "w", buffering=1)
+        # wave 45: real_train_* filled only by vila_lip joint head training
+        # (head loss/acc on the REAL cached rows, not the memory's measure)
         print("task", "epoch", "lr", "train_loss", "train_acc", "test_acc",
+              "real_train_mse", "real_train_acc",
               file=self._head_log, sep=",")
         # wave 31.1: coarse phase timing ('[time]' log lines, greppable)
         self._pt = PhaseTimer()
@@ -607,7 +610,7 @@ class Learner(VilaLearner):
                 test_acc = self._eval_cached(text_features)
                 self.head.train()
             print(self._cur_task, epoch, lr_now, train_loss, train_acc, test_acc,
-                  file=self._head_log, sep=",")
+                  "", "", file=self._head_log, sep=",")
             if epoch % max(1, epochs // 5) == 0 or epoch == epochs:
                 logging.info(
                     "task {} head epoch {}/{} lr {:.5f} train_mse {:.6f} "
@@ -716,7 +719,7 @@ class Learner(VilaLearner):
                                                                keepdim=True)
             test_acc = self._eval_cached(text_features)
         print(self._cur_task, 0, 0.0, train_loss, train_acc, test_acc,
-              file=self._head_log, sep=",")
+              "", "", file=self._head_log, sep=",")
         logging.info(
             "task {} analytic_gram solve gamma {} train_mse {:.6f} "
             "train_acc {:.4f} test_acc {}".format(
@@ -770,7 +773,7 @@ class Learner(VilaLearner):
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             test_acc = self._eval_cached(text_features)
         print(self._cur_task, 0, 0.0, train_loss, train_acc, test_acc,
-              file=self._head_log, sep=",")
+              "", "", file=self._head_log, sep=",")
         logging.info(
             "task {} analytic solve gamma {} train_mse {:.6f} train_acc "
             "{:.4f} test_acc {}".format(self._cur_task, self._an_gamma,

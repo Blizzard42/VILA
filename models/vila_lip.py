@@ -165,6 +165,8 @@ class Learner(UpperboundLearner):
         self._full_batch = self.lip_fit_mb == -1
         if self._full_batch:
             self.lip_fit_mb = 0
+        # wave 45: (X_real, y_real, pi) during joint head training, else None
+        self._real_eval = None
         if self.memory_mode == "joint":
             assert self.lip_fit_mb > 0 or self._full_batch, \
                 "joint mode fits a full-dataset target: mb estimator " \
@@ -279,10 +281,17 @@ class Learner(UpperboundLearner):
                                           s["Y"].to(self._device), 71 + i,
                                           G=None if s.get("G") is None
                                           else s["G"].to(self._device))
+                # wave 45: keep the REAL rows (the cache X still referenced
+                # here) so head training can report true-train loss/acc;
+                # target convention matches training (one-hot minus pi);
+                # k>1 draw caches are fp16 multi-draw rows -- skip those
+                if self.cache_draws == 1:
+                    self._real_eval = (X, self._seen_labels, pi)
                 self._seen_feats, self._seen_labels = self._mem_X, self._mem_Y
                 self._seen_G = self._mem_G
                 self._train_head()
                 self._seen_G = None
+                self._real_eval = None
             logging.info(self._pt.summary())
             return
 
@@ -732,14 +741,16 @@ class Learner(UpperboundLearner):
             if sched is not None:
                 sched.step()
             train_loss, train_acc = loss_sum / n, correct / n
-            test_acc = ""
+            test_acc = real_mse = real_acc = ""
             if self.head_eval_every > 0 and (epoch % self.head_eval_every == 0
                                              or epoch == epochs):
                 self.head.eval()
                 test_acc = self._eval_cached(text_features)
+                if self._real_eval is not None:
+                    real_mse, real_acc = self._real_train_metrics()
                 self.head.train()
             print(self._cur_task, epoch, lr_now, train_loss, train_acc, test_acc,
-                  file=self._head_log, sep=",")
+                  real_mse, real_acc, file=self._head_log, sep=",")
             if epoch % max(1, epochs // 5) == 0 or epoch == epochs:
                 logging.info(
                     "task {} head epoch {}/{} lr {:.5f} train_mse {:.6f} "
@@ -747,3 +758,20 @@ class Learner(UpperboundLearner):
                         self._cur_task, epoch, epochs, lr_now,
                         train_loss, train_acc, test_acc))
         self.head.eval()
+
+    @torch.no_grad()
+    def _real_train_metrics(self, bs=8192):
+        """Wave 45: head MSE/acc on the REAL cached rows (target one-hot
+        minus pi, the training convention) -- the memory's train_loss says
+        how fittable the memory is, this says what that fit buys on data."""
+        X, y, pi = self._real_eval
+        mse_sum = correct = 0
+        for i in range(0, X.shape[0], bs):
+            logits = self.head(X[i:i + bs].float())["logits"]
+            tgt = F.one_hot(y[i:i + bs], self._total_classes).to(logits.dtype)
+            if pi is not None:
+                tgt = tgt - pi.to(logits.dtype)
+            mse_sum += F.mse_loss(logits, tgt, reduction="sum").item()
+            correct += (logits.argmax(dim=1) == y[i:i + bs]).sum().item()
+        n = X.shape[0]
+        return mse_sum / (n * self._total_classes), correct / n
