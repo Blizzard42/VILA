@@ -190,10 +190,19 @@ def exact_state(B, Yat, TAR, mom, lam, Bg, G=None, chunk=0):
     Bd, Yd = B.detach().double(), Yat.detach().double()
     G_B = (G.detach().double() if G is not None
            else gates(Bd, Bg.double(), *TAR.get("gate", ("step", 1.0))))
-    if chunk and TAR["Z"].shape[0] > chunk:
+    if chunk and (TAR["Z"].shape[0] > chunk or Bd.shape[0] > chunk):
         Z, Y, w, Gt = TAR["Z"], TAR["Y"], TAR["w"], TAR["G"]
         m, kk = Bd.shape[0], G_B.shape[1]
-        K1 = (Bd @ Bd.T) * (_gram(G_B, G_B, Bd.dtype) / float(kk))
+        # wave 45: the atom-kernel scalars accumulate over ROW BLOCKS of K1
+        # -- the full m x m fp64 kernel (20 GB at m=50000, x3 temporaries)
+        # is never materialized; pure fp64 re-ordering like the cross terms
+        q_M = torch.zeros((), dtype=torch.float64, device=Bd.device)
+        q_V = torch.zeros((), dtype=torch.float64, device=Bd.device)
+        for a in range(0, m, chunk):
+            K1a = ((Bd[a:a + chunk] @ Bd.T)
+                   * (_gram(G_B[a:a + chunk], G_B, Bd.dtype) / float(kk)))
+            q_M = q_M + (K1a * K1a).sum()
+            q_V = q_V + torch.einsum("ac,ab,bc->", Yd[a:a + chunk], K1a, Yd)
         t_M = torch.zeros((), dtype=torch.float64, device=Bd.device)
         h = torch.zeros_like(Yd)
         for i in range(0, Z.shape[0], chunk):
@@ -201,9 +210,8 @@ def exact_state(B, Yat, TAR, mom, lam, Bg, G=None, chunk=0):
                   * (_gram(G_B, Gt[i:i + chunk], Bd.dtype) / float(kk)))
             t_M = t_M + ((PL * PL) @ w[i:i + chunk]).sum()
             h = h + PL @ (w[i:i + chunk, None] * Y[i:i + chunk])
-        J_M = ((K1 * K1).sum() / m ** 2 - 2.0 * t_M / m + mom["S_M"])
-        J_V = (torch.einsum("ac,ab,bc->", Yd, K1, Yd) / m ** 2
-               - 2.0 * (Yd * h).sum() / m + mom["S_V"])
+        J_M = (q_M / m ** 2 - 2.0 * t_M / m + mom["S_M"])
+        J_V = (q_V / m ** 2 - 2.0 * (Yd * h).sum() / m + mom["S_V"])
     else:
         _, J_M, J_V = _J_terms(Bd, Yd, G_B, TAR["Z"], TAR["Y"], TAR["w"],
                                TAR["G"], mom["S_M"], mom["S_V"], lam)
