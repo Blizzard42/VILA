@@ -104,6 +104,20 @@ class Learner(UpperboundLearner):
             "atom subsampling and chunking are separate arms"
         if self.lip_chunks > 1:
             assert self.memory_mode == "joint", "chunking is a joint-fit arm"
+        # wave 50: chunk-append CL -- task t fits memory_m/nb_tasks FRESH
+        # atoms on the new task's rows alone (one joint class-chunk fit done
+        # at CL time); old chunks are FROZEN and the memory grows to
+        # memory_m by the last task.  With lip_centred_y the targets are
+        # centred with the FINAL uniform pi (1/C_final, known from the task
+        # schedule) so every chunk shares the joint c-per-chunk convention;
+        # grown label columns pad with -1/C_final for the same reason.
+        self.lip_cl_chunk = args.get("lip_cl_chunk", False)
+        if self.lip_cl_chunk:
+            assert self.memory_mode == "lip" and not self.lip_chunks \
+                and not self.lip_chunk_classes and not self.lip_fit_atom_mb, \
+                "lip_cl_chunk is a lip-mode arm (joint chunk knobs excluded)"
+            assert self.lip_fit_init == "warm", \
+                "chunk inits are per-task draws; rand-init not defined here"
         # wave 36: untied per-atom gates -- the memory becomes (x, g, y)
         # triples; the head consumes the stored g for memory rows (test rows
         # stay tied).  Joint mode only, excludes chunks/atom_mb/ste.
@@ -423,6 +437,8 @@ class Learner(UpperboundLearner):
             logging.info("task {} coreset memory: kept {} old + drew {} new"
                          .format(self._cur_task, int(n_old), m - n_old))
             return
+        if self.lip_cl_chunk:
+            return self._append_chunk(new_X, new_y)
         # ---- lip ----
         # verbatim until full (wave 3): while N_seen <= m the union of seen
         # rows IS an exact m'-point memory (int labels, no fit -- lossless by
@@ -436,12 +452,17 @@ class Learner(UpperboundLearner):
                          "no fit)".format(self._cur_task,
                                           self._mem_X.shape[0], m))
             return
-        Y_new = F.one_hot(new_y, C).double()         # plain one-hots (c.9)
+        # wave 50: lip_centred_y in the recursive protocol -- final-uniform-pi
+        # centring (see lip_cl_chunk comment); 0 keeps the plain-one-hot c.9
+        # convention of all prior recursive runs bit-identical
+        cy = 1.0 / self._final_C() if self.lip_centred_y else 0.0
+        Y_new = F.one_hot(new_y, C).double() - cy
         parts = [(new_X.double(), Y_new, 1.0 - w_old)]
         if self._mem_X is not None:
-            Y_old = (F.one_hot(self._mem_Y, C).float()   # verbatim -> one-hot
+            Y_old = (F.one_hot(self._mem_Y, C).float() - cy  # verbatim
                      if not self._mem_Y.dtype.is_floating_point
-                     else F.pad(self._mem_Y, (0, C - self._mem_Y.shape[1])))
+                     else F.pad(self._mem_Y, (0, C - self._mem_Y.shape[1]),
+                                value=-cy))
             parts.insert(0, (self._mem_X.double(), Y_old.double(), w_old))
             B0, Y0 = self._mem_X, Y_old              # warm start (Q2)
             if B0.shape[0] < m:      # verbatim memory smaller than m: top up
@@ -458,6 +479,36 @@ class Learner(UpperboundLearner):
                   * torch.randn(m, allZ.shape[1], device=self._device))
             Y0 = 0.01 * torch.randn(m, C, device=self._device)
         self._fit_memory(parts, B0, Y0, "w_old={:.4f}".format(w_old))
+
+    def _final_C(self):
+        """Total class count of the full schedule (known a priori in the
+        protocol; the final-pi centring constant is 1/this)."""
+        return sum(self.data_manager.get_task_size(i)
+                   for i in range(self.data_manager.nb_tasks))
+
+    def _append_chunk(self, new_X, new_y):
+        """Wave 50 chunk-append CL: fit memory_m/nb_tasks fresh atoms on the
+        new task's rows alone (init = uniform draw of the task's own rows,
+        exactly the joint class-chunk fit), append to the FROZEN memory.
+        lip_curves.csv rows are tagged with the task number."""
+        T = self.data_manager.nb_tasks
+        assert self.memory_m % T == 0, (self.memory_m, T)
+        m_t = self.memory_m // T
+        C = self._total_classes
+        cy = 1.0 / self._final_C() if self.lip_centred_y else 0.0
+        Y_new = F.one_hot(new_y, C).double() - cy
+        old_X, old_Y = self._mem_X, self._mem_Y
+        draw = self._draw_init(new_y, m_t)
+        fit = self._fit_memory([(new_X.double(), Y_new, 1.0)],
+                               new_X[draw], Y_new[draw].float(),
+                               "cl chunk t={}".format(self._cur_task),
+                               m_i=m_t)
+        if old_X is not None:                 # _fit_memory set mem = chunk
+            old_Y = F.pad(old_Y, (0, C - old_Y.shape[1]), value=-cy)
+            self._mem_X = torch.cat([old_X, fit["B"]])
+            self._mem_Y = torch.cat([old_Y, fit["Yat"]])
+        logging.info("task {} cl-chunk memory: {} rows (+{})".format(
+            self._cur_task, self._mem_X.shape[0], m_t))
 
     def _draw_init(self, y, m):
         """Warm-start draw of m row indices.  uniform = randperm (all prior
