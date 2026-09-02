@@ -171,6 +171,16 @@ class Learner(UpperboundLearner):
         self.lip_draw_seed = None if ds in (None, "") else int(ds)
         self.head_from_memory = args.get("head_from_memory", "")
         self.head_from_snap = int(args.get("head_from_snap", 0))  # 0 = final
+        # wave 58: clchunk fit-cache replay -- load a clchunk run's saved
+        # final memory and replay ONLY the sequential warm-started head
+        # trainings (task 0 = verbatim B.5 on the full task-0 cache; task
+        # t>0 = head on the first (t+1)*m/T memory rows, labels sliced to
+        # C_seen -- exact by the -1/C_final padding rule).  No fits.
+        self.cl_head_from_memory = args.get("cl_head_from_memory", "")
+        if self.cl_head_from_memory:
+            assert self.lip_cl_chunk, \
+                "cl_head_from_memory replays a lip_cl_chunk run"
+            assert self.cache_draws == 1, "clchunk replay is 1-draw only"
         self.head_budget_mult = int(args.get("head_budget_mult", 1))
         # wave 43: lip_fit_mb=-1 = INTENTIONAL full-batch joint fit (the
         # exact gradient over all 50k target rows each step, the zero-
@@ -309,6 +319,11 @@ class Learner(UpperboundLearner):
             logging.info(self._pt.summary())
             return
 
+        if self.cl_head_from_memory:
+            self._cl_replay()
+            logging.info(self._pt.summary())
+            return
+
         # capture ONLY the new task's rows (the cache; parent concatenates)
         self._seen_feats = self._seen_labels = None
         self._cache_task_features()
@@ -325,6 +340,14 @@ class Learner(UpperboundLearner):
             self._train_head()                       # memory alone
             if last and self.final_fresh_retrain:
                 self._fresh_retrain()
+        if last and self.memory_save and self.lip_cl_chunk:
+            torch.save(dict(cl_chunk=True, Bg=self.head.Bg.detach().cpu(),
+                            X=self._mem_X.cpu(), Y=self._mem_Y.cpu(),
+                            centred=bool(self.lip_centred_y),
+                            seen_count=int(self._seen_count)),
+                       self._stem + "_memory.pt")
+            logging.info("clchunk memory payload ({} rows) -> {}".format(
+                self._mem_X.shape[0], self._stem + "_memory.pt"))
         self._seen_feats = self._seen_labels = None  # the cache is gone
         logging.info(self._pt.summary())
 
@@ -397,6 +420,45 @@ class Learner(UpperboundLearner):
                                            pay.get("centred"),
                                            self.head_budget_mult))
         self._train_head()
+
+    def _cl_replay(self):
+        """Wave 58: replay a clchunk run's head trainings from its saved
+        final memory.  Task 0 = verbatim B.5 (cache the full task-0 rows,
+        train the head on them); task t>0 = adopt the payload's first
+        (t+1)*m/T rows with labels sliced to C_seen (exact: grown columns
+        were padded with -1/C_final) and train the warm-started head with
+        the step-matched budget.  Fits, train caches (t>0) and memory
+        updates are skipped, so the torch RNG stream differs from the full
+        run's (as joint stage-B's does)."""
+        if self._cur_task == 0:
+            pay = torch.load(self.cl_head_from_memory, map_location="cpu")
+            assert pay.get("cl_chunk"), \
+                "payload is not a clchunk memory: " + self.cl_head_from_memory
+            with torch.no_grad():
+                self.head.Bg.copy_(pay["Bg"].to(self._device))
+            self._replay_X = pay["X"].to(self._device)
+            self._replay_Y = pay["Y"].to(self._device)
+            T = self.data_manager.nb_tasks
+            assert self._replay_X.shape[0] % T == 0
+            self._replay_mt = self._replay_X.shape[0] // T
+            logging.info("cl replay: {} ({} rows = {} x {} chunks, "
+                         "centred={})".format(self.cl_head_from_memory,
+                                              self._replay_X.shape[0],
+                                              self._replay_mt, T,
+                                              pay.get("centred")))
+            self._seen_feats = self._seen_labels = None
+            self._cache_task_features()
+            self._seen_count = self._seen_feats.shape[0]
+            self._train_head()                       # full task-0 data (B.5)
+            self._seen_feats = self._seen_labels = None
+            return
+        self._cache_test_features()                  # eval set only
+        self._seen_count += len(self.train_dataset)
+        rows = (self._cur_task + 1) * self._replay_mt
+        self._seen_feats = self._replay_X[:rows]
+        self._seen_labels = self._replay_Y[:rows, :self._total_classes]
+        self._train_head()                           # memory alone
+        self._seen_feats = self._seen_labels = None
 
     def _fresh_retrain(self):
         """Control (wave 6): rebuild the head -- fresh W1 draw, zeroed output
