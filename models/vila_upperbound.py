@@ -352,8 +352,108 @@ class AGaLU5Head(nn.Module):
         return {"buffer_feature": h, "logits": self.head(self.drop(h))}
 
 
+class AGaLU3v2Head(nn.Module):
+    """Wave 76 depth-enabler variant of AGaLU3: same 2 gated hidden layers
+    at width kh = args["Hidden"], both gates anchored to the TRUE input, but
+    (1) gate_act / gate_alpha configurable (AGaLU3 is hard-step only),
+    (2) head_ln=true adds LayerNorm after each hidden layer's product,
+    (3) head_residual=true makes layer 2 residual: h2 = h1 + g2 (o) (W2 h1)
+    (applied after LN2 when both are on).  LN params (~4kh) are the only
+    param delta vs AGaLU3 at equal kh."""
+
+    def __init__(self, in_features, args, device):
+        super().__init__()
+        kh = args["Hidden"]
+        self.register_buffer(
+            "Bg1", torch.randn(kh, in_features, device=device) / in_features ** 0.5)
+        self.register_buffer(
+            "Bg2", torch.randn(kh, in_features, device=device) / in_features ** 0.5)
+        self.W1 = nn.Parameter(
+            torch.randn(kh, in_features, device=device) / in_features ** 0.5)
+        self.W2 = nn.Parameter(
+            torch.randn(kh, kh, device=device) / kh ** 0.5)
+        self.gate_act = args.get("gate_act", "step")
+        assert self.gate_act in GATE_ACTS, self.gate_act
+        self.gate_alpha = float(args.get("gate_alpha", 1.0))
+        ln = args.get("head_ln", False)
+        self.ln1 = nn.LayerNorm(kh, device=device) if ln else nn.Identity()
+        self.ln2 = nn.LayerNorm(kh, device=device) if ln else nn.Identity()
+        self.residual = bool(args.get("head_residual", False))
+        drop = args.get("head_dropout", 0.0)
+        self.drop = nn.Dropout(drop) if drop > 0 else nn.Identity()
+        self.head = nn.Linear(kh, 0, bias=False, device=device)
+
+    @torch.no_grad()
+    def preprocess(self, network, images, clip_images):
+        return network(images, clip_images)["features"]
+
+    @torch.no_grad()
+    def append_task(self, num_new_classes):
+        old = self.head.weight
+        new = nn.Linear(self.head.in_features, old.shape[0] + num_new_classes,
+                        bias=False, device=old.device)
+        new.weight.zero_()
+        new.weight[: old.shape[0]] = old
+        self.head = new
+
+    def forward(self, features):
+        act = GATE_ACTS[self.gate_act]
+        g1 = act(self.gate_alpha * (features @ self.Bg1.T))
+        g2 = act(self.gate_alpha * (features @ self.Bg2.T))
+        h1 = self.ln1(g1 * (features @ self.W1.T))
+        h2 = self.ln2(g2 * (h1 @ self.W2.T))
+        if self.residual:
+            h2 = h1 + h2
+        return {"buffer_feature": h2, "logits": self.head(self.drop(h2))}
+
+
+class ReLU3Head(nn.Module):
+    """Wave 76: 2 trainable relu hidden layers, h2 = relu(W2 relu(W1 x)),
+    both width kh = args["Hidden"] (kh 4115 total-param-matches the mimic
+    head: no frozen gate buffers, so kh^2 + kh*(1280 + 100) = 22,611,925
+    vs 22,609,920, +0.009%); optional
+    head_ln (LayerNorm after each relu) and head_residual
+    (h2 = h1 + relu-branch) as in AGaLU3v2Head."""
+
+    def __init__(self, in_features, args, device):
+        super().__init__()
+        kh = args["Hidden"]
+        self.W1 = nn.Parameter(
+            torch.randn(kh, in_features, device=device) / in_features ** 0.5)
+        self.W2 = nn.Parameter(
+            torch.randn(kh, kh, device=device) / kh ** 0.5)
+        ln = args.get("head_ln", False)
+        self.ln1 = nn.LayerNorm(kh, device=device) if ln else nn.Identity()
+        self.ln2 = nn.LayerNorm(kh, device=device) if ln else nn.Identity()
+        self.residual = bool(args.get("head_residual", False))
+        drop = args.get("head_dropout", 0.0)
+        self.drop = nn.Dropout(drop) if drop > 0 else nn.Identity()
+        self.head = nn.Linear(kh, 0, bias=False, device=device)
+
+    @torch.no_grad()
+    def preprocess(self, network, images, clip_images):
+        return network(images, clip_images)["features"]
+
+    @torch.no_grad()
+    def append_task(self, num_new_classes):
+        old = self.head.weight
+        new = nn.Linear(self.head.in_features, old.shape[0] + num_new_classes,
+                        bias=False, device=old.device)
+        new.weight.zero_()
+        new.weight[: old.shape[0]] = old
+        self.head = new
+
+    def forward(self, features):
+        h1 = self.ln1(F.relu(features @ self.W1.T))
+        h2 = self.ln2(F.relu(h1 @ self.W2.T))
+        if self.residual:
+            h2 = h1 + h2
+        return {"buffer_feature": h2, "logits": self.head(self.drop(h2))}
+
+
 HEADS = {"vila-mimic": VilaMimicHead, "relu": ReLUHead, "agalu": AGaLUHead,
-         "agalu3": AGaLU3Head, "agalu5": AGaLU5Head}
+         "agalu3": AGaLU3Head, "agalu5": AGaLU5Head,
+         "agalu3v2": AGaLU3v2Head, "relu3": ReLU3Head}
 
 
 # --------------------------------------------------------------------------
