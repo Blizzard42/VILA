@@ -53,7 +53,12 @@ class Learner(UpperboundLearner):
         self.memory_mode = args.get("memory_mode", "lip")
         assert self.memory_mode in ("lip", "coreset", "joint"), self.memory_mode
         if self.memory_mode in ("lip", "joint"):
-            assert args.get("head_model") == "agalu", \
+            # wave 73: lip_allow_any_head=true opts other heads in -- ONLY
+            # sound while the memory stays verbatim (memory_m >= N_seen
+            # forever, no fit ever runs); any real fit/save/reload of lip
+            # memory still requires head.Bg and will raise on other heads.
+            assert (args.get("head_model") == "agalu"
+                    or args.get("lip_allow_any_head", False)), \
                 "lip memory prices the AGaLU feature space (needs head.Bg)"
         self.final_fresh_retrain = args.get("final_fresh_retrain", False)
         self.memory_m = args.get("memory_m", 500)
