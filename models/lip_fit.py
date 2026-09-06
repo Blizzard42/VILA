@@ -67,6 +67,10 @@ GATE_ACTS = {
     "exp": torch.exp,
     "expm1": torch.expm1,
     "softplus": torch.nn.functional.softplus,
+    # wave 81: input-anchored relu gating relu(Bg x) (o) (W1 x) -- the
+    # magnitude-sensitive cousin of "step"; stays in the anchored family
+    # (linear in W1 for fixed gates), so lip fits price it like any gate
+    "relu": torch.nn.functional.relu,
 }
 
 
