@@ -806,11 +806,18 @@ class Learner(UpperboundLearner):
     def _train_head(self):
         """Parent loop with two changes: (1) step-matched epoch budget --
         head_epochs * ceil(N_seen/bs) total steps, re-expressed as epochs over
-        the actual training set; (2) targets may be soft fp32 rows (lip)."""
+        the actual training set; (2) targets may be soft fp32 rows (lip).
+        head_steps > 0 (experiment_1): EXACT absolute optimizer steps per
+        task instead -- head_epochs/step-matching ignored, cosine annealed
+        per STEP over head_steps, final epoch truncated mid-pass."""
         n = self._seen_feats.shape[0]
         bs = self.head_batch_size
-        steps_target = (self.head_budget_mult * self.head_epochs
-                        * ((self._seen_count + bs - 1) // bs))
+        head_steps = int(self.args.get("head_steps", 0))
+        if head_steps > 0:
+            steps_target = head_steps
+        else:
+            steps_target = (self.head_budget_mult * self.head_epochs
+                            * ((self._seen_count + bs - 1) // bs))
         steps_per_epoch = (n + bs - 1) // bs
         epochs = (steps_target + steps_per_epoch - 1) // steps_per_epoch
         soft = self._seen_labels.dtype.is_floating_point
@@ -821,7 +828,8 @@ class Learner(UpperboundLearner):
             opt = optim.SGD(params, lr=self.head_lr, momentum=self.head_momentum,
                             weight_decay=self.head_wd)
         sched = (optim.lr_scheduler.CosineAnnealingLR(
-                     opt, T_max=epochs, eta_min=0.0)
+                     opt, T_max=(steps_target if head_steps > 0 else epochs),
+                     eta_min=0.0)
                  if self.head_schedule == "cosine" else None)
         text_features = None
         if self.head_eval_every > 0:
@@ -829,14 +837,16 @@ class Learner(UpperboundLearner):
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         in_noise = self.args.get("head_input_noise", 0.0)
         feat_std = self._seen_feats.std(dim=0) if in_noise > 0 else None
-        logging.info("task {} head training: n={} epochs={} (step-matched to "
-                     "N_seen={})".format(self._cur_task, n, epochs,
-                                         self._seen_count))
+        logging.info("task {} head training: n={} epochs={} ({})".format(
+            self._cur_task, n, epochs,
+            "head_steps={} absolute".format(steps_target) if head_steps > 0
+            else "step-matched to N_seen={}".format(self._seen_count)))
         self.head.train()
+        gstep = 0
         for epoch in range(1, epochs + 1):
             lr_now = opt.param_groups[0]["lr"]
             perm = torch.randperm(n, device=self._device)
-            loss_sum = correct = 0
+            loss_sum = correct = rows = 0
             for i in range(0, n, bs):
                 idx = perm[i:i + bs]
                 X, y = self._seen_feats[idx], self._seen_labels[idx]
@@ -853,12 +863,18 @@ class Learner(UpperboundLearner):
                 loss = F.mse_loss(logits, tgt)
                 loss.backward()
                 opt.step()
+                gstep += 1
+                if head_steps > 0 and sched is not None:
+                    sched.step()
                 loss_sum += loss.item() * idx.numel()
+                rows += idx.numel()
                 y_idx = y.argmax(dim=1) if soft else y
                 correct += (logits.argmax(dim=1) == y_idx).sum().item()
-            if sched is not None:
+                if head_steps > 0 and gstep >= steps_target:
+                    break
+            if head_steps == 0 and sched is not None:
                 sched.step()
-            train_loss, train_acc = loss_sum / n, correct / n
+            train_loss, train_acc = loss_sum / rows, correct / rows
             test_acc = real_mse = real_acc = ""
             if self.head_eval_every > 0 and (epoch % self.head_eval_every == 0
                                              or epoch == epochs):

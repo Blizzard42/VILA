@@ -649,7 +649,18 @@ class Learner(VilaLearner):
         budget (draws are data richness, not extra compute)."""
         n = self._seen_feats.shape[0]
         epochs = self.head_epochs
-        if self.cache_draws > 1:
+        # head_steps > 0 (experiment_1): EXACT absolute optimizer steps per
+        # task -- head_epochs ignored, cosine annealed per STEP, final epoch
+        # truncated mid-pass (mirrors vila_lip._train_head)
+        head_steps = int(self.args.get("head_steps", 0))
+        steps_target = 0
+        if head_steps > 0:
+            steps_target = head_steps
+            spe = (n + self.head_batch_size - 1) // self.head_batch_size
+            epochs = (steps_target + spe - 1) // spe
+            logging.info("head_steps={} absolute: n={}, epochs={}".format(
+                steps_target, n, epochs))
+        elif self.cache_draws > 1:
             bs = self.head_batch_size
             n_real = n // self.cache_draws
             steps_target = self.head_epochs * ((n_real + bs - 1) // bs)
@@ -666,7 +677,8 @@ class Learner(VilaLearner):
             opt = optim.SGD(params, lr=self.head_lr, momentum=self.head_momentum,
                             weight_decay=self.head_wd)
         sched = (optim.lr_scheduler.CosineAnnealingLR(
-                     opt, T_max=epochs, eta_min=0.0)
+                     opt, T_max=(steps_target if head_steps > 0 else epochs),
+                     eta_min=0.0)
                  if self.head_schedule == "cosine" else None)
         text_features = None
         if self.head_eval_every > 0:
@@ -680,10 +692,11 @@ class Learner(VilaLearner):
         # ours is mean-MSE, so the equivalent coefficient is gamma/(N*C)
         l2_coef = self.head_l2 / (n * self._total_classes)
         self.head.train()  # dropout active only while fitting
+        gstep = 0
         for epoch in range(1, epochs + 1):
             lr_now = opt.param_groups[0]["lr"]
             perm = torch.randperm(n, device=self._device)
-            loss_sum = correct = 0
+            loss_sum = correct = rows = 0
             for i in range(0, n, self.head_batch_size):
                 idx = perm[i:i + self.head_batch_size]
                 X, y = self._seen_feats[idx].float(), self._seen_labels[idx]
@@ -698,11 +711,17 @@ class Learner(VilaLearner):
                     loss = mse + l2_coef * sum(p.pow(2).sum() for p in params)
                 loss.backward()
                 opt.step()
+                gstep += 1
+                if head_steps > 0 and sched is not None:
+                    sched.step()
                 loss_sum += mse.item() * y.numel()
+                rows += y.numel()
                 correct += (logits.argmax(dim=1) == y).sum().item()
-            if sched is not None:
+                if head_steps > 0 and gstep >= steps_target:
+                    break
+            if head_steps == 0 and sched is not None:
                 sched.step()
-            train_loss, train_acc = loss_sum / n, correct / n
+            train_loss, train_acc = loss_sum / rows, correct / rows
             test_acc = ""
             if self.head_eval_every > 0 and (epoch % self.head_eval_every == 0
                                              or epoch == epochs):
