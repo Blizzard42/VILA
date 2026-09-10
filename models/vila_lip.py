@@ -33,6 +33,7 @@ New config keys: memory_mode (lip|coreset), memory_m, lip_fit_steps,
 lip_fit_lr (RELATIVE), lip_lambda_mv, lip_fit_eval_every, lip_fit_adam_eps.
 LIP fit curves land in <stem>_lip_curves.csv beside the head curves.
 """
+import contextlib
 import logging
 
 import numpy as np
@@ -40,6 +41,7 @@ import torch
 from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
+from concurrent.futures import ThreadPoolExecutor
 
 from models.vila import num_workers
 from models.vila_upperbound import HEADS, Learner as UpperboundLearner
@@ -123,6 +125,38 @@ class Learner(UpperboundLearner):
                 "lip_cl_chunk is a lip-mode arm (joint chunk knobs excluded)"
             assert self.lip_fit_init == "warm", \
                 "chunk inits are per-task draws; rand-init not defined here"
+        # wave 89: round-robin CLASS chunks with per-chunk re-distillation.
+        # k = lip_rr_k chunks of capacity s = memory_m / k.  Every class
+        # (ascending label, pointer persists across tasks) goes to the next
+        # chunk: verbatim while the chunk's represented-point count stays
+        # <= s, else the chunk is RE-FIT to s atoms against the recursive
+        # target (n_rep/n_tot) * moments(chunk) + (n_c/n_tot) * moments(class),
+        # init = uniform draw of s rows from (chunk rows U class rows).  The
+        # <= classes-per-task fits of one task touch disjoint chunks and run
+        # as parallel CUDA streams (lip_rr_parallel=false -> sequential).  A
+        # target with <= lip_fit_mb rows is fit EXACTLY (mb=0).  Head training
+        # draws every batch row from chunk j w.p. n_rep_j / sum n_rep, then
+        # uniformly inside the chunk (see _train_head).  Task 0 keeps the B.5
+        # special case (head on the full real task-0 cache, then fill chunks).
+        self.lip_cl_rr = args.get("lip_cl_rr", False)
+        self.lip_rr_k = int(args.get("lip_rr_k", 0) or 0)
+        self.lip_rr_parallel = bool(args.get("lip_rr_parallel", True))
+        if self.lip_cl_rr:
+            assert self.memory_mode == "lip" and not self.lip_cl_chunk \
+                and not self.lip_chunks and not self.lip_chunk_classes \
+                and not self.lip_fit_atom_mb and not self.lip_fit_jitter \
+                and not self.lip_fit_ste, \
+                "lip_cl_rr is a lip-mode arm (other chunk/fit arms excluded)"
+            assert self.lip_rr_k > 0 and self.memory_m % self.lip_rr_k == 0, \
+                ("lip_rr_k must divide memory_m", self.memory_m, self.lip_rr_k)
+            assert self.lip_fit_init == "warm", \
+                "rr inits are union draws; rand-init not defined here"
+            self._rr_chunks = [dict(X=None, Y=None, n_rep=0)
+                               for _ in range(self.lip_rr_k)]
+            self._rr_ptr = 0
+            self._rr_log = None
+        self._mem_w = None      # per-memory-row batch-sampling prob (rr) | None
+        self._seen_w = None     # same, for the CURRENT head-train set | None
         # wave 36: untied per-atom gates -- the memory becomes (x, g, y)
         # triples; the head consumes the stored g for memory rows (test rows
         # stay tied).  Joint mode only, excludes chunks/atom_mb/ste.
@@ -135,6 +169,7 @@ class Learner(UpperboundLearner):
         # runs accumulate one lip_fit count per chunk; union_eval is timed
         # inline in _fit_memory_chunked)
         for name, meth in (("lip_fit", "_fit_memory"),
+                           ("lip_fit", "_rr_run_fits"),    # wave 89
                            ("snap_head", "_train_snap_head"),
                            ("cache_test_feats", "_cache_test_features"),
                            ("fresh_retrain", "_fresh_retrain")):
@@ -213,6 +248,10 @@ class Learner(UpperboundLearner):
             self._stem = stem
             self._lip_log = open(stem + "_lip_curves.csv", "w", buffering=1)
             print("task", *LIP_CURVE, file=self._lip_log, sep=",")
+            if self.lip_cl_rr:      # one row per (task, chunk, eval step)
+                self._rr_log = open(stem + "_rr_curves.csv", "w", buffering=1)
+                print("task", "chunk", "n_rep", *LIP_CURVE,
+                      file=self._rr_log, sep=",")
 
     # ---------------------------------------------------------------- flow
     def incremental_train(self, data_manager):
@@ -342,14 +381,20 @@ class Learner(UpperboundLearner):
         else:
             self._update_memory(new_X, new_y, N_prev)  # compress FIRST (B.4)
             self._seen_feats, self._seen_labels = self._mem_X, self._mem_Y
+            self._seen_w = self._mem_w               # rr: n_rep sampler
             self._train_head()                       # memory alone
+            self._seen_w = None
             if last and self.final_fresh_retrain:
                 self._fresh_retrain()
-        if last and self.memory_save and self.lip_cl_chunk:
+        if last and self.memory_save and (self.lip_cl_chunk or self.lip_cl_rr):
             torch.save(dict(cl_chunk=True, Bg=self.head.Bg.detach().cpu(),
                             X=self._mem_X.cpu(), Y=self._mem_Y.cpu(),
                             centred=bool(self.lip_centred_y),
-                            seen_count=int(self._seen_count)),
+                            seen_count=int(self._seen_count),
+                            **({} if not self.lip_cl_rr else dict(
+                                cl_rr=True, k=self.lip_rr_k,
+                                n_rep=[c["n_rep"] for c in self._rr_chunks],
+                                w=self._mem_w.cpu()))),
                        self._stem + "_memory.pt")
             logging.info("clchunk memory payload ({} rows) -> {}".format(
                 self._mem_X.shape[0], self._stem + "_memory.pt"))
@@ -506,6 +551,8 @@ class Learner(UpperboundLearner):
             return
         if self.lip_cl_chunk:
             return self._append_chunk(new_X, new_y)
+        if self.lip_cl_rr:
+            return self._rr_update(new_X, new_y)
         # ---- lip ----
         # verbatim until full (wave 3): while N_seen <= m the union of seen
         # rows IS an exact m'-point memory (int labels, no fit -- lossless by
@@ -577,6 +624,116 @@ class Learner(UpperboundLearner):
         logging.info("task {} cl-chunk memory: {} rows (+{})".format(
             self._cur_task, self._mem_X.shape[0], m_t))
 
+    def _rr_update(self, new_X, new_y):
+        """Wave 89 round-robin class chunks (see the constructor comment).
+        Builds one fit job per overflowing class, runs the task's jobs in
+        parallel CUDA streams, then rebuilds the memory as the chunk union
+        with per-row sampling weights n_rep_j / (|chunk_j| * sum n_rep)."""
+        k, s = self.lip_rr_k, self.memory_m // self.lip_rr_k
+        C = self._total_classes
+        cy = 1.0 / self._final_C() if self.lip_centred_y else 0.0
+        for ch in self._rr_chunks:              # grow label columns (as e1)
+            if ch["Y"] is not None and ch["Y"].shape[1] < C:
+                ch["Y"] = F.pad(ch["Y"], (0, C - ch["Y"].shape[1]), value=-cy)
+        jobs = []
+        for c in torch.unique(new_y).tolist():   # ascending label
+            j, ch = self._rr_ptr, self._rr_chunks[self._rr_ptr]
+            sel = new_y == c
+            X_c, n_c = new_X[sel], int(sel.sum().item())
+            Y_c = F.one_hot(new_y[sel], C).double() - cy
+            n_tot = ch["n_rep"] + n_c
+            if n_tot <= s:                       # verbatim append, no fit
+                ch["X"] = X_c.clone() if ch["X"] is None \
+                    else torch.cat([ch["X"], X_c])
+                ch["Y"] = Y_c.float() if ch["Y"] is None \
+                    else torch.cat([ch["Y"], Y_c.float()])
+                logging.info("task {} rr class {} -> chunk {} verbatim "
+                             "({} rows, n_rep {} -> {}, s={})".format(
+                                 self._cur_task, c, j, ch["X"].shape[0],
+                                 ch["n_rep"], n_tot, s))
+            else:                                # re-fit chunk to s atoms
+                parts = [(X_c.double(), Y_c, n_c / n_tot)]
+                U_X, U_Y = X_c, Y_c.float()
+                if ch["n_rep"] > 0:              # empty chunk = weight 0
+                    parts.insert(0, (ch["X"].double(), ch["Y"].double(),
+                                     ch["n_rep"] / n_tot))
+                    U_X = torch.cat([ch["X"], X_c])
+                    U_Y = torch.cat([ch["Y"], U_Y])
+                draw = torch.randperm(U_X.shape[0], device=self._device)[:s]
+                jobs.append(dict(j=j, c=c, n_old=ch["n_rep"], n_c=n_c,
+                                 n_tot=n_tot, parts=parts,
+                                 B0=U_X[draw].clone(), Y0=U_Y[draw].clone()))
+                logging.info("task {} rr class {} -> chunk {} RE-FIT "
+                             "(w_old {:.4f} over {} rows, w_new {:.4f} over "
+                             "{} rows -> {} atoms)".format(
+                                 self._cur_task, c, j, ch["n_rep"] / n_tot,
+                                 0 if ch["X"] is None else ch["X"].shape[0],
+                                 n_c / n_tot, n_c, s))
+            ch["n_rep"] = n_tot
+            self._rr_ptr = (j + 1) % k
+        if jobs:
+            fits = self._rr_run_fits(jobs)
+            for job, fit in zip(jobs, fits):
+                ch = self._rr_chunks[job["j"]]
+                ch["X"], ch["Y"] = fit["B"], fit["Yat"]
+                for i in range(len(fit["curve"]["step"])):
+                    print(self._cur_task, job["j"], job["n_tot"],
+                          *[fit["curve"][kk][i] for kk in LIP_CURVE],
+                          file=self._rr_log, sep=",")
+        live = [ch for ch in self._rr_chunks if ch["X"] is not None]
+        tot = float(sum(ch["n_rep"] for ch in live))
+        self._mem_X = torch.cat([ch["X"] for ch in live])
+        self._mem_Y = torch.cat([ch["Y"] for ch in live])
+        self._mem_w = torch.cat([
+            torch.full((ch["X"].shape[0],), ch["n_rep"] / (ch["X"].shape[0] * tot),
+                       device=self._device) for ch in live])
+        logging.info("task {} rr memory: {} rows in {} chunks ({} fits), "
+                     "n_rep={}".format(
+                         self._cur_task, self._mem_X.shape[0], len(live),
+                         len(jobs), [ch["n_rep"] for ch in self._rr_chunks]))
+
+    def _rr_run_fits(self, jobs):
+        """Run the task's independent chunk fits.  Targets are built up
+        front (cheap); each fit runs on its own CUDA stream in its own
+        thread (fit_lip's per-step .item() releases the GIL, so the
+        streams overlap).  mb=0 (exact J) when the target fits in one
+        minibatch.  Returns fits in job order; curves are NOT written to
+        the shared task-tagged lip log (the rr log carries them)."""
+        gate = self._fit_gate()
+        tars = [make_target(job["parts"], self.head.Bg, gate=gate)
+                for job in jobs]
+        for job, TAR in zip(jobs, tars):
+            n = TAR["Z"].shape[0]
+            job["mb"] = 0 if n <= self.lip_fit_mb else self.lip_fit_mb
+            logging.info("task {} rr fit chunk {}: target {} rows, m={}, "
+                         "{} steps, mb={}".format(
+                             self._cur_task, job["j"], n, job["B0"].shape[0],
+                             self.lip_fit_steps, job["mb"]))
+        def one(job, TAR, stream):
+            ctx = (torch.cuda.stream(stream) if stream is not None
+                   else contextlib.nullcontext())
+            with ctx:
+                fit = self._fit_call(TAR, job["B0"], job["Y0"], mb=job["mb"],
+                                     tag="chunk {}".format(job["j"]))
+                if stream is not None:
+                    stream.synchronize()
+            return fit
+        par = self.lip_rr_parallel and len(jobs) > 1 \
+            and self._device.type == "cuda"
+        if par:
+            torch.cuda.current_stream(self._device).synchronize()
+            streams = [torch.cuda.Stream(self._device) for _ in jobs]
+            with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+                fits = list(ex.map(one, jobs, tars, streams))
+        else:
+            fits = [one(job, TAR, None) for job, TAR in zip(jobs, tars)]
+        for job, fit in zip(jobs, fits):
+            if fit["status"] != "ok":
+                raise RuntimeError("rr lip fit diverged at task {} chunk {} "
+                                   "step {}".format(self._cur_task, job["j"],
+                                                    fit["diverged_at"]))
+        return fits
+
     def _draw_init(self, y, m):
         """Warm-start draw of m row indices.  uniform = randperm (all prior
         waves); balanced (wave 15) = shuffle within each class, then take
@@ -629,22 +786,7 @@ class Learner(UpperboundLearner):
         logging.info("task {} lip fit: target {} rows ({}), m={}, {} steps"
                      .format(self._cur_task, TAR["Z"].shape[0], note,
                              m_i or self.memory_m, steps))
-        fit = fit_lip(TAR, B0, Y0, self.head.Bg, steps=steps,
-                      eval_TAR=eval_TAR,
-                      fit_lr=self.lip_fit_lr, lam=self.lip_lambda_mv,
-                      eval_every=self.lip_fit_eval_every,
-                      adam_eps=self.lip_fit_adam_eps,
-                      mb=self.lip_fit_mb, jitter=self.lip_fit_jitter,
-                      snapshot_best=self.lip_fit_snapshot_best,
-                      sched=self.lip_fit_sched,
-                      snap_steps=self.lip_snap_steps,
-                      wm_chunk=2048 if TAR["Z"].shape[0] > 20000 else 8192,
-                      ste=self.lip_fit_ste,
-                      atom_mb=self.lip_fit_atom_mb,
-                      atom_mode=self.lip_fit_atom_mode,
-                      untied_g=self.lip_untied_g,
-                      es_chunk=8192,
-                      verbose=lambda s: logging.info(s.strip()))
+        fit = self._fit_call(TAR, B0, Y0, steps=steps, eval_TAR=eval_TAR)
         if fit["status"] != "ok":
             raise RuntimeError("lip fit diverged at task {} step {}".format(
                 self._cur_task, fit["diverged_at"]))
@@ -655,6 +797,30 @@ class Learner(UpperboundLearner):
             print(tag, *[fit["curve"][k][i] for k in LIP_CURVE],
                   file=self._lip_log, sep=",")
         return fit
+
+    def _fit_call(self, TAR, B0, Y0, steps=None, eval_TAR=None, mb=None,
+                  tag=""):
+        """The bare fit_lip call with this run's knobs (mb overridable:
+        wave 89 exact-when-small).  No state is touched."""
+        pre = "  [{}]".format(tag) if tag else ""
+        return fit_lip(TAR, B0, Y0, self.head.Bg,
+                       steps=steps or self.lip_fit_steps,
+                       eval_TAR=eval_TAR,
+                       fit_lr=self.lip_fit_lr, lam=self.lip_lambda_mv,
+                       eval_every=self.lip_fit_eval_every,
+                       adam_eps=self.lip_fit_adam_eps,
+                       mb=self.lip_fit_mb if mb is None else mb,
+                       jitter=self.lip_fit_jitter,
+                       snapshot_best=self.lip_fit_snapshot_best,
+                       sched=self.lip_fit_sched,
+                       snap_steps=self.lip_snap_steps,
+                       wm_chunk=2048 if TAR["Z"].shape[0] > 20000 else 8192,
+                       ste=self.lip_fit_ste,
+                       atom_mb=self.lip_fit_atom_mb,
+                       atom_mode=self.lip_fit_atom_mode,
+                       untied_g=self.lip_untied_g,
+                       es_chunk=8192,
+                       verbose=lambda s: logging.info(pre + s.strip()))
 
     def _fit_memory_chunked(self, X, Y):
         """Wave 31 arm (b): split the joint target into k class-STRATIFIED
@@ -837,10 +1003,20 @@ class Learner(UpperboundLearner):
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         in_noise = self.args.get("head_input_noise", 0.0)
         feat_std = self._seen_feats.std(dim=0) if in_noise > 0 else None
-        logging.info("task {} head training: n={} epochs={} ({})".format(
+        # wave 89: n_rep-proportional sampler -- every batch row picks a
+        # memory row w.p. _seen_w (chunk j w.p. n_rep_j/sum, uniform inside
+        # the chunk), WITH replacement, always bs rows; the shuffled-epoch
+        # loop below is kept only as the logging cadence
+        wsamp = self._seen_w
+        if wsamp is not None:
+            assert head_steps > 0 and wsamp.shape[0] == n, \
+                "weighted sampler needs head_steps and per-row weights"
+        logging.info("task {} head training: n={} epochs={} ({}){}".format(
             self._cur_task, n, epochs,
             "head_steps={} absolute".format(steps_target) if head_steps > 0
-            else "step-matched to N_seen={}".format(self._seen_count)))
+            else "step-matched to N_seen={}".format(self._seen_count),
+            "" if wsamp is None else
+            ", n_rep-weighted sampler bs={} with replacement".format(bs)))
         self.head.train()
         gstep = 0
         for epoch in range(1, epochs + 1):
@@ -848,7 +1024,8 @@ class Learner(UpperboundLearner):
             perm = torch.randperm(n, device=self._device)
             loss_sum = correct = rows = 0
             for i in range(0, n, bs):
-                idx = perm[i:i + bs]
+                idx = (perm[i:i + bs] if wsamp is None
+                       else torch.multinomial(wsamp, bs, replacement=True))
                 X, y = self._seen_feats[idx], self._seen_labels[idx]
                 if in_noise > 0:
                     X = X + in_noise * feat_std * torch.randn_like(X)
