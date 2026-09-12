@@ -504,3 +504,34 @@ class SUN(iData):
 
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+
+
+class Places365(iData):
+    """e_48 experiment_2: Places365-Standard, small (256x256) variant.
+    1,803,460 train / 36,500 val (100 per class, the labelled 'test' here;
+    the official test split is unlabelled).  Not an ImageFolder: the train
+    tree is data_256_standard/<letter>/<class>[/<sub>]/NNNNNNNN.jpg and val
+    is one flat dir + places365_val.txt, so the file lists come from
+    torchvision.datasets.Places365 (download=False: setup_places365.sh has
+    already fetched + md5-verified the official CSAIL tars into
+    data/places365).  Class index = line order of categories_places365.txt,
+    the same order as utils/labels.json['places365']."""
+    use_path = True
+
+    train_trsf = build_transform(True, None)
+    test_trsf = build_transform(False, None)
+    common_trsf = []
+
+    class_order = np.arange(365).tolist()
+
+    def download_data(self):
+        root = "data/places365"
+        train_dset = datasets.Places365(root, split="train-standard",
+                                        small=True, download=False)
+        test_dset = datasets.Places365(root, split="val", small=True,
+                                       download=False)
+        assert len(train_dset.classes) == 365, len(train_dset.classes)
+        print(train_dset.class_to_idx)
+
+        self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
+        self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
