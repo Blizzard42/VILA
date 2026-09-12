@@ -74,7 +74,24 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from models.vila import Learner as VilaLearner, num_workers
+from models.base import BaseLearner
 from models.lip_fit import GATE_ACTS
+
+
+class _CachedVILAStub(nn.Module):
+    """Stands in for utils.VILA.VILA when features come from a cache: no
+    parameters, no forward; only the attributes the learners read."""
+    class _Clip:
+        pass
+
+    def __init__(self, fcache):
+        super().__init__()
+        self.feature_dim = int(fcache["feature_dim"]) - int(fcache["clip_dim"])
+        self.clip = self._Clip()
+        self.clip.out_dim = int(fcache["clip_dim"])
+        self.backbone = None
+        self.ac_model = None
+        self._device = None
 
 
 class PhaseTimer:
@@ -464,7 +481,33 @@ HEADS = {"vila-mimic": VilaMimicHead, "relu": ReLUHead, "agalu": AGaLUHead,
 class Learner(VilaLearner):
 
     def __init__(self, args):
-        super().__init__(args)
+        # e_48 experiment_2 feature-cache CONSUMER ("features_from" = path of a
+        # models/vila.py feature_cache_save file, "{seed}" substituted): the
+        # two ViTs are never built; train rows come from the cache by class
+        # slice (the ONE augmented draw VILA itself used), test rows and CLIP
+        # text features likewise, adapter training is skipped (its weights
+        # are baked into the cache).  Everything downstream (head, memory,
+        # fits, cached eval) is unchanged.
+        self.features_from = (args.get("features_from", "") or "").format(
+            seed=args["seed"])
+        if self.features_from:
+            self._fcache = torch.load(self.features_from, map_location="cpu")
+            BaseLearner.__init__(self, args)          # skip vila.Learner's ViT build
+            self._network = _CachedVILAStub(self._fcache)
+            self.batch_size = args["batch_size"]
+            self.init_lr = args["init_lr"]
+            self.weight_decay = args["weight_decay"]
+            self.min_lr = args["min_lr"]
+            self.args = args
+            self.R = None
+            logging.info("features_from: {} (train_F {}, test_F {}, text_F {}, "
+                         "recipe {})".format(self.features_from,
+                                             tuple(self._fcache["train_F"].shape),
+                                             tuple(self._fcache["test_F"].shape),
+                                             tuple(self._fcache["text_F"].shape),
+                                             self._fcache["recipe"]))
+        else:
+            super().__init__(args)
         assert len(self._multiple_gpus) == 1, "vila_upperbound is single-GPU"
         self.head = None
         self._seen_feats = self._seen_labels = None
@@ -526,6 +569,8 @@ class Learner(VilaLearner):
                                       shuffle=False, num_workers=num_workers)
 
         if self._cur_task == 0:
+            if self.features_from:
+                self._fc_check(data_manager)
             self._init_train(self.train_loader, self.test_loader)
             in_features = self.feature_dim + self._network.clip.out_dim
             self.head = HEADS[self.args.get("head_model", "vila-mimic")](
@@ -562,7 +607,11 @@ class Learner(VilaLearner):
         self._network.to(self._device)
         self._network.eval()
         k = self.cache_draws
-        if self.cache_load:
+        if self.features_from:
+            assert k == 1 and not self.cache_load and not self.cache_save
+            feats, labels = self._fc_train_rows(self._known_classes,
+                                                self._total_classes)
+        elif self.cache_load:
             if self._cache_file is None:
                 self._cache_file = torch.load(self.cache_load,
                                               map_location="cpu")
@@ -601,17 +650,21 @@ class Learner(VilaLearner):
         self._seen_labels = (labels if self._seen_labels is None
                              else torch.cat([self._seen_labels, labels]))
         if self.head_eval_every > 0:
-            new_test = self.data_manager.get_dataset(
-                np.arange(self._known_classes, self._total_classes),
-                source="test", mode="test")
-            loader = DataLoader(new_test, batch_size=self.batch_size,
-                                shuffle=False, num_workers=num_workers)
-            feats, labels = [], []
-            for _, data, clip_data, label in loader:
-                feats.append(self.head.preprocess(
-                    self._network, data.to(self._device), clip_data.to(self._device)))
-                labels.append(label.to(self._device))
-            feats, labels = torch.cat(feats), torch.cat(labels)
+            if self.features_from:
+                feats, labels = self._fc_test_rows(self._known_classes,
+                                                   self._total_classes)
+            else:
+                new_test = self.data_manager.get_dataset(
+                    np.arange(self._known_classes, self._total_classes),
+                    source="test", mode="test")
+                loader = DataLoader(new_test, batch_size=self.batch_size,
+                                    shuffle=False, num_workers=num_workers)
+                feats, labels = [], []
+                for _, data, clip_data, label in loader:
+                    feats.append(self.head.preprocess(
+                        self._network, data.to(self._device), clip_data.to(self._device)))
+                    labels.append(label.to(self._device))
+                feats, labels = torch.cat(feats), torch.cat(labels)
             self._test_feats = (feats if self._test_feats is None
                                 else torch.cat([self._test_feats, feats]))
             self._test_labels = (labels if self._test_labels is None
@@ -625,6 +678,68 @@ class Learner(VilaLearner):
                 float(self.head.gate_scale)))
 
     @torch.no_grad()
+    # ---- experiment_2 feature-cache consumer helpers ----------------------
+    def _fc_check(self, data_manager):
+        co = list(data_manager._class_order)
+        assert co == list(self._fcache["class_order"]), \
+            "features_from class order != this run's (seed/dataset mismatch)"
+        assert len(data_manager._train_targets) == self._fcache["train_F"].shape[0]
+        assert (torch.as_tensor(data_manager._train_targets)
+                == self._fcache["train_y"]).all(), "train label mismatch"
+        r = self._fcache["recipe"]
+        for k in ("dataset", "seed", "init_cls", "backbone_type", "ffn_num"):
+            assert str(r[k]) == str(self.args[k]), (k, r[k], self.args[k])
+        self._fc_test_dev = self._fcache["test_F"].to(self._device)
+        self._fc_test_y_dev = self._fcache["test_y"].to(self._device)
+        logging.info("features_from: class order / labels / recipe verified")
+
+    def _fc_train_rows(self, lo, hi):
+        y = self._fcache["train_y"]
+        m = (y >= lo) & (y < hi)
+        return (self._fcache["train_F"][m].to(self._device),
+                y[m].to(self._device))
+
+    def _fc_test_rows(self, lo, hi):
+        y = self._fc_test_y_dev
+        m = (y >= lo) & (y < hi)
+        return self._fc_test_dev[m], y[m]
+
+    def _init_train(self, train_loader, test_loader):
+        if self.features_from:
+            logging.info("features_from: task-0 adapter training skipped "
+                         "(weights baked into the cache)")
+            return
+        return super()._init_train(train_loader, test_loader)
+
+    def _feat_from_temp(self):
+        if self.features_from:
+            return self._fcache["text_F"][:self._total_classes].to(self._device)
+        return super()._feat_from_temp()
+
+    def eval_task(self):
+        """features_from: _eval_cnn's metric from the cached clean test rows
+        of the classes seen so far (no image forward); else the parent."""
+        if not self.features_from:
+            return super().eval_task()
+        self.head.eval()
+        text_features = self._feat_from_temp()
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        clip_dim = self._network.clip.out_dim
+        Fm, ym = self._fc_test_rows(0, self._total_classes)
+        y_pred = []
+        with torch.no_grad():
+            for i in range(0, Fm.shape[0], 512):
+                f = Fm[i:i + 512]
+                adpt_logits = self.head(f)["logits"]
+                clip_logits = f[:, -clip_dim:] @ text_features.T
+                rerank_logits = self.clip_rerank(adpt_logits, clip_logits,
+                                                 topk=self.args["rerank_topk"])
+                logits = adpt_logits * 0.8 + rerank_logits * 0.2
+                y_pred.append(torch.topk(logits, k=self.topk, dim=1, largest=True,
+                                         sorted=True)[1].cpu().numpy())
+        self.head.train()
+        return self._evaluate(np.concatenate(y_pred), ym.cpu().numpy()), None
+
     def _eval_cached(self, text_features):
         """_eval_cnn's metric (0.8 adpt + 0.2 clip-rerank) from the cached
         clean test features; the CLIP branch is the last clip.out_dim dims of

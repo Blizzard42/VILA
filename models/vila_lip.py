@@ -125,6 +125,20 @@ class Learner(UpperboundLearner):
                 "lip_cl_chunk is a lip-mode arm (joint chunk knobs excluded)"
             assert self.lip_fit_init == "warm", \
                 "chunk inits are per-task draws; rand-init not defined here"
+        # experiment_2: lip_chunk_per_class -- chunk t holds
+        # (memory_m / nb_classes) atoms PER CLASS in task t (task 0 with 5
+        # classes gets 5x), so unequal tasks keep a fixed per-class budget;
+        # memory_save_every -- also write the clchunk payload every k tasks
+        # (0 = last task only) so a long run's fits survive a kill and can be
+        # replayed (cl_head_from_memory) under a different head budget.
+        self.lip_chunk_per_class = bool(args.get("lip_chunk_per_class", False))
+        if self.lip_chunk_per_class:
+            assert self.lip_cl_chunk, "lip_chunk_per_class is a clchunk knob"
+            assert self.memory_m % int(args["nb_classes"]) == 0, \
+                ("memory_m must be a multiple of nb_classes", self.memory_m,
+                 args["nb_classes"])
+        self.memory_save_every = int(args.get("memory_save_every", 0) or 0)
+        self._chunk_rows = []          # rows appended per task (payload)
         # wave 89: round-robin CLASS chunks with per-chunk re-distillation.
         # k = lip_rr_k chunks of capacity s = memory_m / k.  Every class
         # (ascending label, pointer persists across tasks) goes to the next
@@ -386,11 +400,15 @@ class Learner(UpperboundLearner):
             self._seen_w = None
             if last and self.final_fresh_retrain:
                 self._fresh_retrain()
-        if last and self.memory_save and (self.lip_cl_chunk or self.lip_cl_rr):
+        if (self.memory_save and (self.lip_cl_chunk or self.lip_cl_rr)
+                and (last or (self.memory_save_every > 0
+                              and (self._cur_task + 1) % self.memory_save_every == 0))):
             torch.save(dict(cl_chunk=True, Bg=self.head.Bg.detach().cpu(),
                             X=self._mem_X.cpu(), Y=self._mem_Y.cpu(),
                             centred=bool(self.lip_centred_y),
                             seen_count=int(self._seen_count),
+                            chunk_rows=list(self._chunk_rows),
+                            tasks_done=int(self._cur_task + 1),
                             **({} if not self.lip_cl_rr else dict(
                                 cl_rr=True, k=self.lip_rr_k,
                                 n_rep=[c["n_rep"] for c in self._rr_chunks],
@@ -407,20 +425,24 @@ class Learner(UpperboundLearner):
         (_eval_cached) still needs the accumulated clean test features."""
         if self.head_eval_every <= 0:
             return
-        self._network.to(self._device)
-        self._network.eval()
-        new_test = self.data_manager.get_dataset(
-            np.arange(self._known_classes, self._total_classes),
-            source="test", mode="test")
-        loader = DataLoader(new_test, batch_size=self.batch_size,
-                            shuffle=False, num_workers=num_workers)
-        feats, labels = [], []
-        for _, data, clip_data, label in loader:
-            feats.append(self.head.preprocess(
-                self._network, data.to(self._device),
-                clip_data.to(self._device)))
-            labels.append(label.to(self._device))
-        feats, labels = torch.cat(feats), torch.cat(labels)
+        if self.features_from:
+            feats, labels = self._fc_test_rows(self._known_classes,
+                                               self._total_classes)
+        else:
+            self._network.to(self._device)
+            self._network.eval()
+            new_test = self.data_manager.get_dataset(
+                np.arange(self._known_classes, self._total_classes),
+                source="test", mode="test")
+            loader = DataLoader(new_test, batch_size=self.batch_size,
+                                shuffle=False, num_workers=num_workers)
+            feats, labels = [], []
+            for _, data, clip_data, label in loader:
+                feats.append(self.head.preprocess(
+                    self._network, data.to(self._device),
+                    clip_data.to(self._device)))
+                labels.append(label.to(self._device))
+            feats, labels = torch.cat(feats), torch.cat(labels)
         self._test_feats = (feats if self._test_feats is None
                             else torch.cat([self._test_feats, feats]))
         self._test_labels = (labels if self._test_labels is None
@@ -489,13 +511,21 @@ class Learner(UpperboundLearner):
             self._replay_X = pay["X"].to(self._device)
             self._replay_Y = pay["Y"].to(self._device)
             T = self.data_manager.nb_tasks
-            assert self._replay_X.shape[0] % T == 0
-            self._replay_mt = self._replay_X.shape[0] // T
-            logging.info("cl replay: {} ({} rows = {} x {} chunks, "
-                         "centred={})".format(self.cl_head_from_memory,
-                                              self._replay_X.shape[0],
-                                              self._replay_mt, T,
-                                              pay.get("centred")))
+            if pay.get("chunk_rows"):
+                self._replay_cum = np.cumsum(pay["chunk_rows"]).tolist()
+                assert self._replay_cum[-1] == self._replay_X.shape[0]
+                assert len(self._replay_cum) == T, \
+                    ("payload has {} chunks, run has {} tasks".format(
+                        len(self._replay_cum), T))
+                self._replay_mt = None
+            else:
+                assert self._replay_X.shape[0] % T == 0
+                self._replay_mt = self._replay_X.shape[0] // T
+                self._replay_cum = [(t + 1) * self._replay_mt for t in range(T)]
+            logging.info("cl replay: {} ({} rows, chunks {}, centred={})".format(
+                self.cl_head_from_memory, self._replay_X.shape[0],
+                pay.get("chunk_rows", "uniform x{}".format(self._replay_mt)),
+                pay.get("centred")))
             self._seen_feats = self._seen_labels = None
             self._cache_task_features()
             self._seen_count = self._seen_feats.shape[0]
@@ -504,7 +534,7 @@ class Learner(UpperboundLearner):
             return
         self._cache_test_features()                  # eval set only
         self._seen_count += len(self.train_dataset)
-        rows = (self._cur_task + 1) * self._replay_mt
+        rows = self._replay_cum[self._cur_task]
         self._seen_feats = self._replay_X[:rows]
         self._seen_labels = self._replay_Y[:rows, :self._total_classes]
         self._train_head()                           # memory alone
@@ -606,8 +636,13 @@ class Learner(UpperboundLearner):
         exactly the joint class-chunk fit), append to the FROZEN memory.
         lip_curves.csv rows are tagged with the task number."""
         T = self.data_manager.nb_tasks
-        assert self.memory_m % T == 0, (self.memory_m, T)
-        m_t = self.memory_m // T
+        if self.lip_chunk_per_class:
+            m_t = (self.memory_m // self.data_manager.nb_classes) \
+                * (self._total_classes - self._known_classes)
+        else:
+            assert self.memory_m % T == 0, (self.memory_m, T)
+            m_t = self.memory_m // T
+        self._chunk_rows.append(int(m_t))
         C = self._total_classes
         cy = 1.0 / self._final_C() if self.lip_centred_y else 0.0
         Y_new = F.one_hot(new_y, C).double() - cy
