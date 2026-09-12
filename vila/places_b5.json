@@ -1,0 +1,29 @@
+{
+    "prefix": "",
+    "dataset": "places365b",
+    "memory_size": 0,
+    "memory_per_class": 0,
+    "fixed_memory": false,
+    "shuffle": true,
+    "init_cls": 5,
+    "increment": 1,
+    "model_name": "vila",
+    "backbone_type": "pretrained_vit_b16_224_adapter",
+    "device": [
+        "0"
+    ],
+    "seed": [
+        1993
+    ],
+    "num_workers": 8,
+    "optimizer": "sgd",
+    "batch_size": 32,
+    "adpt_epoch": 30,
+    "init_lr": 0.01,
+    "weight_decay": 0.0005,
+    "min_lr": 1e-06,
+    "Hidden": 16384,
+    "ffn_num": 64,
+    "rerank_topk": 6,
+    "feature_cache_save": "data/feature_cache/places365b_s{seed}.pt"
+}

@@ -535,3 +535,31 @@ class Places365(iData):
 
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+
+
+class Places365B(iData):
+    """e_48 experiment_2: class-BALANCED Places365-Standard small subset --
+    3068 train images per class (the smallest class), fixed seed 0, built once
+    by make_places365_balanced.py into data/places365/places365_train_balanced
+    .txt (sha256 af76797c...).  Test = the full 36,500-image val split (100
+    per class), identical to Places365."""
+    use_path = True
+
+    train_trsf = build_transform(True, None)
+    test_trsf = build_transform(False, None)
+    common_trsf = []
+
+    class_order = np.arange(365).tolist()
+
+    def download_data(self):
+        root = "data/places365"
+        paths, labels = [], []
+        for line in open(root + "/places365_train_balanced.txt"):
+            p, y = line.split()
+            paths.append(root + "/data_256_standard" + p)
+            labels.append(int(y))
+        assert len(paths) == 365 * 3068, len(paths)
+        test_dset = datasets.Places365(root, split="val", small=True,
+                                       download=False)
+        self.train_data, self.train_targets = np.array(paths), np.array(labels)
+        self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
