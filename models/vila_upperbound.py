@@ -569,8 +569,6 @@ class Learner(VilaLearner):
                                       shuffle=False, num_workers=num_workers)
 
         if self._cur_task == 0:
-            if self.features_from:
-                self._fc_check(data_manager)
             self._init_train(self.train_loader, self.test_loader)
             in_features = self.feature_dim + self._network.clip.out_dim
             self.head = HEADS[self.args.get("head_model", "vila-mimic")](
@@ -706,6 +704,9 @@ class Learner(VilaLearner):
 
     def _init_train(self, train_loader, test_loader):
         if self.features_from:
+            # task 0, both learners' incremental_train (self.data_manager is
+            # set before this call): verify the cache, stage the test rows
+            self._fc_check(self.data_manager)
             logging.info("features_from: task-0 adapter training skipped "
                          "(weights baked into the cache)")
             return
