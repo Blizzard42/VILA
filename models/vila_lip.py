@@ -139,6 +139,24 @@ class Learner(UpperboundLearner):
                  args["nb_classes"])
         self.memory_save_every = int(args.get("memory_save_every", 0) or 0)
         self._chunk_rows = []          # rows appended per task (payload)
+        # experiment_2 fan-out: lip_fit_only=<dir> runs ONLY the clchunk fits
+        # (no head training, no memory accumulation) for the tasks in
+        # lip_fit_tasks="a-b" (inclusive; default all) and writes one
+        # <dir>/chunk_s<seed>_t<task>.pt per task.  Chunk fits depend only on
+        # the task's rows, the gate Bg (seed-determined at task 0) and the
+        # RNG, which is reseeded per task (seed*100000 + t) so every chunk is
+        # reproducible in any job.  merge_chunks.py turns the files into a
+        # cl_head_from_memory payload for the (sequential) head replay.
+        self.lip_fit_only = args.get("lip_fit_only", "") or ""
+        if self.lip_fit_only:
+            assert self.lip_cl_chunk and self.features_from, \
+                "lip_fit_only is a clchunk arm run from a feature cache"
+            rng = str(args.get("lip_fit_tasks", "") or "")
+            if rng:
+                a, b = (int(x) for x in rng.split("-"))
+                self.lip_fit_tasks = range(a, b + 1)
+            else:
+                self.lip_fit_tasks = None
         # wave 89: round-robin CLASS chunks with per-chunk re-distillation.
         # k = lip_rr_k chunks of capacity s = memory_m / k.  Every class
         # (ascending label, pointer persists across tasks) goes to the next
@@ -294,6 +312,9 @@ class Learner(UpperboundLearner):
         self.head.append_task(self._total_classes - self._known_classes)
 
         last = self._cur_task == data_manager.nb_tasks - 1
+        if self.lip_fit_only:
+            self._fit_only_task()
+            return
         if self.memory_mode == "joint":
             # STEP-ABLATION (wave 6): keep the WHOLE cache (parent append);
             # the head never trains until the final task, where the full seen
@@ -629,6 +650,53 @@ class Learner(UpperboundLearner):
         protocol; the final-pi centring constant is 1/this)."""
         return sum(self.data_manager.get_task_size(i)
                    for i in range(self.data_manager.nb_tasks))
+
+    def _fit_only_task(self):
+        """experiment_2 fan-out: the clchunk fit of THIS task alone (same
+        m_t / centring / draw / fit as _append_chunk), written to a file."""
+        import os
+        t = self._cur_task
+        if self.lip_fit_tasks is not None and t not in self.lip_fit_tasks:
+            return
+        out = os.path.join(self.lip_fit_only,
+                           "chunk_s{}_t{}.pt".format(self.args["seed"], t))
+        if os.path.exists(out):
+            logging.info("fit-only: task {} exists, skipping ({})".format(t, out))
+            return
+        os.makedirs(self.lip_fit_only, exist_ok=True)
+        self._seen_feats = self._seen_labels = None
+        new_X, new_y = self._fc_train_rows(self._known_classes,
+                                           self._total_classes)
+        self._seen_feats, self._seen_labels = new_X, new_y   # gate_norm etc.
+        seed_t = int(self.args["seed"]) * 100000 + t
+        torch.manual_seed(seed_t)
+        torch.cuda.manual_seed_all(seed_t)
+        C = self._total_classes
+        cy = 1.0 / self._final_C() if self.lip_centred_y else 0.0
+        if self.lip_chunk_per_class:
+            m_t = (self.memory_m // self.data_manager.nb_classes) \
+                * (self._total_classes - self._known_classes)
+        else:
+            m_t = self.memory_m // self.data_manager.nb_tasks
+        Y_new = F.one_hot(new_y, C).double() - cy
+        draw = self._draw_init(new_y, m_t)
+        fit = self._fit_memory([(new_X.double(), Y_new, 1.0)],
+                               new_X[draw], Y_new[draw].float(),
+                               "fit-only chunk t={}".format(t), m_i=m_t)
+        Bg = self.head.Bg.detach()
+        torch.save(dict(task=t, seed=int(self.args["seed"]), m_t=int(m_t),
+                        C=int(C), cy=float(cy), n_rows=int(new_X.shape[0]),
+                        classes=[self._known_classes, self._total_classes],
+                        B=fit["B"].detach().cpu(), Yat=fit["Yat"].detach().cpu(),
+                        J_final=float(fit["curve"]["J"][-1]),
+                        Bg_sum=float(Bg.double().sum()),
+                        Bg_abs=float(Bg.double().abs().sum()),
+                        **({"Bg": Bg.cpu()} if t == 0 else {})),
+                   out)
+        logging.info("fit-only: task {} chunk {} rows J={:.3e} -> {}".format(
+            t, m_t, float(fit["curve"]["J"][-1]), out))
+        self._mem_X = self._mem_Y = None
+        self._seen_feats = self._seen_labels = None
 
     def _append_chunk(self, new_X, new_y):
         """Wave 50 chunk-append CL: fit memory_m/nb_tasks fresh atoms on the
