@@ -138,6 +138,18 @@ class Learner(UpperboundLearner):
                 ("memory_m must be a multiple of nb_classes", self.memory_m,
                  args["nb_classes"])
         self.memory_save_every = int(args.get("memory_save_every", 0) or 0)
+        # experiment_2 uniform-coreset control: memory_mode=coreset +
+        # coreset_per_class=true -> the memory GROWS like the per-class LIP
+        # chunk (memory_m / nb_classes REAL rows per class, drawn uniformly
+        # without replacement from that class's rows, appended per task,
+        # int labels -> plain one-hot in the head), instead of the fixed-m
+        # recursive uniform sample of the plain coreset mode.
+        self.coreset_per_class = bool(args.get("coreset_per_class", False))
+        if self.coreset_per_class:
+            assert self.memory_mode == "coreset", "coreset_per_class is a coreset-mode knob"
+            assert self.memory_m % int(args["nb_classes"]) == 0, \
+                ("memory_m must be a multiple of nb_classes", self.memory_m,
+                 args["nb_classes"])
         self._chunk_rows = []          # rows appended per task (payload)
         # experiment_2 fan-out: lip_fit_only=<dir> runs ONLY the clchunk fits
         # (no head training, no memory accumulation) for the tasks in
@@ -587,6 +599,24 @@ class Learner(UpperboundLearner):
         """memory <- compress(w_old * memory + w_new * new rows), m points."""
         m, C = self.memory_m, self._total_classes
         w_old = N_prev / (N_prev + new_X.shape[0])
+        if self.memory_mode == "coreset" and self.coreset_per_class:
+            per = m // self.data_manager.nb_classes
+            idx = []
+            for c in range(self._known_classes, self._total_classes):
+                rows = torch.nonzero(new_y == c, as_tuple=False).flatten()
+                idx.append(rows[torch.randperm(rows.numel(),
+                                               device=self._device)[:per]])
+            draw = torch.cat(idx)
+            self._mem_X = (new_X[draw].clone() if self._mem_X is None
+                           else torch.cat([self._mem_X, new_X[draw]]))
+            self._mem_Y = (new_y[draw].clone() if self._mem_Y is None
+                           else torch.cat([self._mem_Y, new_y[draw]]))
+            self._chunk_rows.append(int(draw.numel()))
+            logging.info("task {} per-class coreset memory: {} rows (+{} = {} "
+                         "classes x {})".format(self._cur_task,
+                                                self._mem_X.shape[0], draw.numel(),
+                                                self._total_classes - self._known_classes, per))
+            return
         if self.memory_mode == "coreset":
             n_old = int(round(w_old * m))
             keep = torch.randperm(self._mem_X.shape[0],
