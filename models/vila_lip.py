@@ -722,7 +722,9 @@ class Learner(UpperboundLearner):
                         Bg_sum=float(Bg.double().sum()),
                         Bg_abs=float(Bg.double().abs().sum()),
                         **({"Bg": Bg.cpu()} if t == 0 else {})),
-                   out)
+                   out + ".tmp.{}".format(os.getpid()))
+        os.replace(out + ".tmp.{}".format(os.getpid()), out)   # atomic: duplicate
+        #                                    arrays (e.g. overcap) never interleave
         logging.info("fit-only: task {} chunk {} rows J={:.3e} -> {}".format(
             t, m_t, float(fit["curve"]["J"][-1]), out))
         self._mem_X = self._mem_Y = None
