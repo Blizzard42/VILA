@@ -6,7 +6,7 @@ from torchvision import transforms
 # from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000, iCIFAR224, iImageNetR,iImageNetA,CUB, objectnet, omnibenchmark, vtab
 from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000, iCIFAR224, \
         iImageNetR,iImageNetA,CUB, objectnet, omnibenchmark, vtab, Caltech101, Food101, Flowers, \
-        Aircraft,UCF101,StanfordCars, SUN, Places365, Places365B
+        Aircraft,UCF101,StanfordCars, SUN, Places365, Places365B, iCIFAR224B
 import json
 
 
@@ -299,6 +299,8 @@ def _get_idata(dataset_name, args=None):
         return iImageNet100()
     elif name == "cifar224":
         return iCIFAR224(args)
+    elif name == "cifar224b":
+        return iCIFAR224B(args)
     elif name == "imagenetr":
         return iImageNetR(args)
     elif name == "imageneta":

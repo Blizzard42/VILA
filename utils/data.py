@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 from torchvision import datasets, transforms
 from utils.toolkit import split_images_labels
@@ -145,6 +147,28 @@ class iCIFAR224(iData):
         self.test_data, self.test_targets = test_dataset.data, np.array(
             test_dataset.targets
         )
+
+class iCIFAR224B(iCIFAR224):
+    """e_48 experiment_1 addendum j: cifar100 train set uniformly subsampled
+    to 50 images per class (N=5000), fixed np.random.RandomState(0) draw
+    shared by all seeds (the experiment_2 places365b convention), kept in
+    original order.  Test split untouched."""
+
+    def download_data(self):
+        super().download_data()
+        rng = np.random.RandomState(0)
+        keep = []
+        for y in range(100):
+            idx = np.where(self.train_targets == y)[0]
+            keep.append(np.sort(rng.choice(idx, 50, replace=False)))
+        keep = np.sort(np.concatenate(keep))
+        self.train_data = self.train_data[keep]
+        self.train_targets = self.train_targets[keep]
+        logging.info(
+            f"cifar224b: train subsampled to {len(self.train_targets)} rows "
+            f"(50/class, fixed RandomState(0) draw)"
+        )
+
 
 class iImageNet1000(iData):
     use_path = True
