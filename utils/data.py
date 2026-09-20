@@ -587,3 +587,42 @@ class Places365B(iData):
                                        download=False)
         self.train_data, self.train_targets = np.array(paths), np.array(labels)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+
+
+class INat21B(iData):
+    """e_48 experiment_3: class-BALANCED iNaturalist-2021 subset -- 152 train
+    images per species (the smallest species), fixed seed 0, built once by
+    make_inat21_balanced.py into data/inat21/inat21_train_balanced.txt
+    ("<path under 2021_train> <category_id>").  Test = the full 100,000-image
+    val split (10 per species) from data/inat21/val.json.  Class index =
+    category_id (0..9999, the NNNNN prefix of torchvision's directory names),
+    the same order as utils/labels.json['inat21b'].  Layout is torchvision's
+    (setup_inat21.sh): data/inat21/2021_train/<dir>/*.jpg, 2021_valid/<dir>/*.jpg."""
+    use_path = True
+
+    train_trsf = build_transform(True, None)
+    test_trsf = build_transform(False, None)
+    common_trsf = []
+
+    class_order = np.arange(10000).tolist()
+
+    def download_data(self):
+        import json
+        root = "data/inat21"
+        paths, labels = [], []
+        for line in open(root + "/inat21_train_balanced.txt"):
+            p, y = line.split()
+            paths.append(root + "/2021_train/" + p)
+            labels.append(int(y))
+        assert len(paths) == 10000 * 152, len(paths)
+        val = json.load(open(root + "/val.json"))
+        img2file = {im["id"]: im["file_name"] for im in val["images"]}
+        tp, tl = [], []
+        for a in val["annotations"]:
+            f = img2file[a["image_id"]]
+            assert f.startswith("val/"), f
+            tp.append(root + "/2021_valid/" + f[len("val/"):])
+            tl.append(int(a["category_id"]))
+        assert len(tp) == 100000, len(tp)
+        self.train_data, self.train_targets = np.array(paths), np.array(labels)
+        self.test_data, self.test_targets = np.array(tp), np.array(tl)

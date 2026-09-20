@@ -137,6 +137,19 @@ class Learner(UpperboundLearner):
             assert self.memory_m % int(args["nb_classes"]) == 0, \
                 ("memory_m must be a multiple of nb_classes", self.memory_m,
                  args["nb_classes"])
+        # experiment_3 (iNat21): lip_cl_chunk_classes=k -- in the fan-out
+        # (lip_fit_only) every task's classes split into contiguous groups of
+        # k (class-order space); each group is fitted ALONE on its own rows
+        # with lip_cl_chunk_m atoms, the atom labels learned ONLY over the
+        # group's k columns; the saved Yat is full C_total width with every
+        # off-group column = the filler (-1/C_final centred, 0 otherwise).
+        # memory_m is then informational (= chunks x lip_cl_chunk_m).
+        self.lip_cl_chunk_classes = int(args.get("lip_cl_chunk_classes", 0) or 0)
+        self.lip_cl_chunk_m = int(args.get("lip_cl_chunk_m", 0) or 0)
+        if self.lip_cl_chunk_classes:
+            assert self.lip_cl_chunk and not self.lip_chunk_per_class, \
+                "lip_cl_chunk_classes is a clchunk knob (not per-class)"
+            assert self.lip_cl_chunk_m > 0, "lip_cl_chunk_m (atoms per group) required"
         self.memory_save_every = int(args.get("memory_save_every", 0) or 0)
         # experiment_2 uniform-coreset control: memory_mode=coreset +
         # coreset_per_class=true -> the memory GROWS like the per-class LIP
@@ -688,6 +701,9 @@ class Learner(UpperboundLearner):
         t = self._cur_task
         if self.lip_fit_tasks is not None and t not in self.lip_fit_tasks:
             return
+        if self.lip_cl_chunk_classes:
+            self._fit_only_task_grouped(t)
+            return
         out = os.path.join(self.lip_fit_only,
                            "chunk_s{}_t{}.pt".format(self.args["seed"], t))
         if os.path.exists(out):
@@ -728,6 +744,58 @@ class Learner(UpperboundLearner):
         logging.info("fit-only: task {} chunk {} rows J={:.3e} -> {}".format(
             t, m_t, float(fit["curve"]["J"][-1]), out))
         self._mem_X = self._mem_Y = None
+        self._seen_feats = self._seen_labels = None
+
+    def _fit_only_task_grouped(self, t):
+        """experiment_3 fan-out: the task's classes in contiguous groups of
+        lip_cl_chunk_classes; group g = classes [lo, hi) fitted alone (its
+        cached rows, lip_cl_chunk_m atoms, uniform warm-start draw, labels
+        over its k columns only) -> chunk_s<seed>_t<t>_c<g>.pt with Yat at
+        full C_total width, off-group columns = -cy.  RNG reseeded per group
+        (seed*100000 + t*100 + g); lip curve rows tagged t*100+g."""
+        import os
+        k, m_g = self.lip_cl_chunk_classes, self.lip_cl_chunk_m
+        n_cls = self._total_classes - self._known_classes
+        assert n_cls % k == 0, ("task classes not divisible by group", n_cls, k)
+        C = self._total_classes
+        cy = 1.0 / self._final_C() if self.lip_centred_y else 0.0
+        os.makedirs(self.lip_fit_only, exist_ok=True)
+        for g in range(n_cls // k):
+            out = os.path.join(self.lip_fit_only, "chunk_s{}_t{}_c{}.pt".format(
+                self.args["seed"], t, g))
+            if os.path.exists(out):
+                logging.info("fit-only: task {} group {} exists, skipping".format(t, g))
+                continue
+            lo = self._known_classes + g * k
+            hi = lo + k
+            self._seen_feats = self._seen_labels = None
+            X, y = self._fc_train_rows(lo, hi)
+            self._seen_feats, self._seen_labels = X, y   # gate_norm etc.
+            seed_g = int(self.args["seed"]) * 100000 + t * 100 + g
+            torch.manual_seed(seed_g)
+            torch.cuda.manual_seed_all(seed_g)
+            Y_g = F.one_hot(y - lo, k).double() - cy       # group columns ONLY
+            draw = self._draw_init(y, m_g)
+            fit = self._fit_memory([(X.double(), Y_g, 1.0)], X[draw],
+                                   Y_g[draw].float(),
+                                   "fit-only t={} g={} cls {}-{}".format(t, g, lo, hi - 1),
+                                   task_tag=t * 100 + g, m_i=m_g)
+            Yat = torch.full((m_g, C), -cy, dtype=fit["Yat"].dtype)
+            Yat[:, lo:hi] = fit["Yat"].detach().cpu()
+            Bg = self.head.Bg.detach()
+            torch.save(dict(task=t, group=g, seed=int(self.args["seed"]),
+                            m_t=int(m_g), C=int(C), cy=float(cy),
+                            n_rows=int(X.shape[0]), classes=[lo, hi],
+                            B=fit["B"].detach().cpu(), Yat=Yat,
+                            J_final=float(fit["curve"]["J"][-1]),
+                            Bg_sum=float(Bg.double().sum()),
+                            Bg_abs=float(Bg.double().abs().sum()),
+                            **({"Bg": Bg.cpu()} if t == 0 and g == 0 else {})),
+                       out + ".tmp.{}".format(os.getpid()))
+            os.replace(out + ".tmp.{}".format(os.getpid()), out)
+            logging.info("fit-only: task {} group {} ({} rows, {} atoms) J={:.3e} -> {}".format(
+                t, g, X.shape[0], m_g, float(fit["curve"]["J"][-1]), out))
+            self._mem_X = self._mem_Y = None
         self._seen_feats = self._seen_labels = None
 
     def _append_chunk(self, new_X, new_y):
