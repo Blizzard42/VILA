@@ -1,32 +1,38 @@
 {
-    "places365b": ["a photo of a {}.", "a photo of the {}."],
-    "places365": ["a photo of a {}.", "a photo of the {}."],   
+    "places365b": [
+        "a photo of a {}.",
+        "a photo of the {}."
+    ],
+    "places365": [
+        "a photo of a {}.",
+        "a photo of the {}."
+    ],
     "objectnet": [
-    "itap of a {}.",
-    "a bad photo of the {}.",
-    "a origami {}.",
-    "a photo of the large {}.",
-    "a {} in a video game.",
-    "art of the {}.",
-    "a photo of the small {}."
+        "itap of a {}.",
+        "a bad photo of the {}.",
+        "a origami {}.",
+        "a photo of the large {}.",
+        "a {} in a video game.",
+        "art of the {}.",
+        "a photo of the small {}."
     ],
     "imageneta": [
-    "itap of a {}.",
-    "a bad photo of the {}.",
-    "a origami {}.",
-    "a photo of the large {}.",
-    "a {} in a video game.",
-    "art of the {}.",
-    "a photo of the small {}."
+        "itap of a {}.",
+        "a bad photo of the {}.",
+        "a origami {}.",
+        "a photo of the large {}.",
+        "a {} in a video game.",
+        "art of the {}.",
+        "a photo of the small {}."
     ],
     "imagenetr": [
-    "itap of a {}.",
-    "a bad photo of the {}.",
-    "a origami {}.",
-    "a photo of the large {}.",
-    "a {} in a video game.",
-    "art of the {}.",
-    "a photo of the small {}."
+        "itap of a {}.",
+        "a bad photo of the {}.",
+        "a origami {}.",
+        "a photo of the large {}.",
+        "a {} in a video game.",
+        "art of the {}.",
+        "a photo of the small {}."
     ],
     "food101": [
         "a photo of {}, a type of food."
@@ -71,7 +77,6 @@
         "a photo of the small {}.",
         "a photo of the big {}."
     ],
-    
     "cub": [
         "a photo of a {}, a type of bird."
     ],
@@ -134,7 +139,6 @@
         "a example of the person practicing {}.",
         "a demonstration of the person practicing {}."
     ],
-    
     "flowers": [
         "a photo of a {}, a type of flower."
     ],
@@ -174,7 +178,6 @@
         "a drawing of the {}.",
         "a doodle of the {}."
     ],
-    
     "aircraft": [
         "a photo of a {}, a type of aircraft.",
         "a photo of the {}, a type of aircraft."
@@ -190,6 +193,10 @@
         "a photo of my old {}."
     ],
     "sun": [
+        "a photo of a {}.",
+        "a photo of the {}."
+    ],
+    "inat21b": [
         "a photo of a {}.",
         "a photo of the {}."
     ]
