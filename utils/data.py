@@ -626,3 +626,39 @@ class INat21B(iData):
         assert len(tp) == 100000, len(tp)
         self.train_data, self.train_targets = np.array(paths), np.array(labels)
         self.test_data, self.test_targets = np.array(tp), np.array(tl)
+
+
+class ImageNet1kB(iData):
+    """e_48 experiment_5: class-BALANCED ImageNet-1k (ILSVRC2012) subset -- 732
+    train images per class (the smallest class), fixed seed 0, built once by
+    make_imagenet1k_balanced.py into data/imagenet1k/imagenet1k_train_balanced
+    .txt ("<wnid>/<file> <label>").  Test = the official 50,000-image val split
+    (50 per class) via data/imagenet1k/imagenet1k_val.txt (setup_imagenet1k.sh,
+    labels from the devkit synset list).  Class index = sorted-wnid position,
+    the order of utils/labels.json['imagenet'] (copied to 'imagenet1kb').
+    TUNING SET ONLY: the adapter ViT (AugReg in21k -> in1k fine-tuned) trained
+    on these train images; val is the one ImageNet split it never trained on."""
+    use_path = True
+
+    train_trsf = build_transform(True, None)
+    test_trsf = build_transform(False, None)
+    common_trsf = []
+
+    class_order = np.arange(1000).tolist()
+
+    def download_data(self):
+        root = "data/imagenet1k"
+        paths, labels = [], []
+        for line in open(root + "/imagenet1k_train_balanced.txt"):
+            p, y = line.split()
+            paths.append(root + "/train/" + p)
+            labels.append(int(y))
+        assert len(paths) == 1000 * 732, len(paths)
+        tp, tl = [], []
+        for line in open(root + "/imagenet1k_val.txt"):
+            p, y = line.split()
+            tp.append(root + "/val/" + p)
+            tl.append(int(y))
+        assert len(tp) == 50000, len(tp)
+        self.train_data, self.train_targets = np.array(paths), np.array(labels)
+        self.test_data, self.test_targets = np.array(tp), np.array(tl)

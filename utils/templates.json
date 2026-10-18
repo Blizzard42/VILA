@@ -199,5 +199,14 @@
     "inat21b": [
         "a photo of a {}.",
         "a photo of the {}."
+    ],
+    "imagenet1kb": [
+        "itap of a {}.",
+        "a bad photo of the {}.",
+        "a origami {}.",
+        "a photo of the large {}.",
+        "a {} in a video game.",
+        "art of the {}.",
+        "a photo of the small {}."
     ]
 }
