@@ -334,6 +334,19 @@ class Learner(UpperboundLearner):
             self.head = HEADS[self.args.get("head_model", "vila-mimic")](
                 in_features, self.args, self._device)
             self._network.ac_model = self.head
+            # experiment_9 (2026-11-07): the device randn behind Bg differs across
+            # GPU models (titan_x / rtx_6000 != a40 for the same seed), so fits run
+            # off-A40 adopt a saved A40 gate: gate_from = a .pt holding "Bg" (a
+            # seed's task-0 chunk or merged payload). Unset = unchanged behaviour.
+            gate_from = (self.args.get("gate_from", "") or "").format(
+                seed=self.args["seed"])
+            if gate_from:
+                Bg = torch.load(gate_from, map_location="cpu")["Bg"]
+                assert Bg.shape == self.head.Bg.shape, (Bg.shape, self.head.Bg.shape)
+                with torch.no_grad():
+                    self.head.Bg.copy_(Bg.to(self.head.Bg))
+                logging.info("gate_from: {} (Bg_sum {!r})".format(
+                    gate_from, float(self.head.Bg.double().sum())))
         self.head.append_task(self._total_classes - self._known_classes)
 
         last = self._cur_task == data_manager.nb_tasks - 1
